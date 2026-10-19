@@ -1,0 +1,27 @@
+# Все текстовые файлы храним и чекаутим с LF (Unix-окончания строк)
+* text=auto eol=lf
+
+# Явно форсируем LF для критичных типов
+*.py    text eol=lf
+*.sh    text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.toml  text eol=lf
+*.json  text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
+
+# Бинарные файлы — не трогаем окончания строк
+*.jar   binary
+*.png   binary
+*.jpg   binary
+*.gif   binary
+*.zip   binary
+*.mrpack binary
+*.gz    binary
+*.tar   binary
+*.bundle binary
+*.ico   binary
+*.pdf   binary

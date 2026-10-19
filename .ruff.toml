@@ -1,0 +1,14 @@
+target-version = "py39"
+line-length = 120
+
+[lint]
+select = ["E", "F", "W"]
+ignore = [
+    "E501",   # line too long — русские строки часто > 120 символов
+    "E402",   # module import not at top — в wine.py CLI обрабатывается до импортов
+    "E741",   # ambiguous variable name 'l' — используется в comprehension
+]
+
+[lint.per-file-ignores]
+# В wine.py импорт конфига намеренно после sys.path.insert
+"wine.py" = ["E402"]

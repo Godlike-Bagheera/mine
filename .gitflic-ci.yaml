@@ -1,0 +1,26 @@
+stages:
+  - lint
+  - syntax
+  - test
+
+image: python:3.11-slim
+
+lint:
+  stage: lint
+  script:
+    - pip install --quiet ruff
+    - ruff check .
+  allow_failure: false
+
+syntax:
+  stage: syntax
+  script:
+    - python -m compileall -q modules wine.py
+
+test:
+  stage: test
+  script:
+    - python tests/test_fixes.py
+    - python tests/test_worlds.py
+    - python tests/test_shader_mod_fixes.py
+  allow_failure: false
