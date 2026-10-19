@@ -1,5 +1,8 @@
-# Все текстовые файлы храним и чекаутим с LF (Unix-окончания строк)
+# Храним в репозитории LF; на Windows-чекаут — CRLF для .cmd/.bat
+# (cmd.exe плохо переваривает LF-only батники), остальное — LF.
 * text=auto eol=lf
+*.cmd text eol=crlf
+*.bat text eol=crlf
 
 # Явно форсируем LF для критичных типов
 *.py    text eol=lf
