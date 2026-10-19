@@ -16,7 +16,7 @@ from pathlib import Path
 
 from modules import debug, state
 from modules.config import (
-    HOME, WINE_DIR, WINE_BIN, DXVK_DIR, DEFAULT_PREFIX, PREFIXES_DIR,
+    HOME, WINE_BIN, DXVK_DIR, DEFAULT_PREFIX, PREFIXES_DIR,
     DXVK_OVERRIDES,
 )
 from modules.platform_utils import IS_WINDOWS, user_home
@@ -47,7 +47,12 @@ def _looks_minecraft(p: Path) -> bool:
                 return True
         # portable-инстанты лаунчеров (Legacy/Prism): versions непустой —
         # этого достаточно; пустые папки не считаем установками (иначе
-        # домашний ~/.minecraft без версий затенял бы реальные установки)
+        # домашний ~/.minecraft без версий затенял бы реальные установки).
+        # Исключение: папка сама называется .minecraft — это явный корень
+        # игры, даже если versions ещё пуст (свежий Legacy portable до
+        # первой загрузки версии).
+        if p.name.lower() == ".minecraft":
+            return True
         try:
             return any((p / "versions").iterdir())
         except Exception:
@@ -139,7 +144,7 @@ def find_minecraft_dirs(limit: int = 12) -> list:
     # и инстанты лаунчеров по общепринятым именам папок: HOME/<Имя>/.minecraft,
     # HOME/<Имя>/minecraft (например HOME/Prism/.minecraft).
     try:
-        base = HOME_T = Path(str(HOME)) if isinstance(HOME, (str, Path)) else user_home()
+        base = Path(str(HOME)) if isinstance(HOME, (str, Path)) else user_home()
         if not base.is_dir():
             base = user_home()
         if base.is_dir():
@@ -160,9 +165,12 @@ def find_minecraft_dirs(limit: int = 12) -> list:
 
     # легаси-Wine: .minecraft внутри префиксов (drive_c/users/*/.minecraft).
     # ВАЖНО: не переприсваиваем `roots` — только дополняем найденное.
+    # ВАЖНО 2: читаем КАК АТРИБУТЫ МОДУЛЯ (prefix.WINE_PREFIX/PREFIXES_DIR),
+    # тесты monkeypatch-ят именно их; from-import скопировал бы значения
+    # config в момент импорта и подмены не сработали бы.
     try:
         wroots = []
-        for pbase in (Path(WINE_PREFIX), Path(PREFIXES_DIR)):
+        for pbase in (Path(str(WINE_PREFIX)), Path(str(PREFIXES_DIR))):
             if not pbase.is_dir():
                 continue
             users = pbase / "drive_c" / "users"
@@ -175,7 +183,8 @@ def find_minecraft_dirs(limit: int = 12) -> list:
             if _looks_minecraft(mc) and not _in_worlds_backup(mc):
                 roots.append(mc.resolve())
         # легаси: <HOME>/wine-portable/prefix/drive_c/users/<u>/.minecraft
-        for mc in Path(HOME).glob("*/*/drive_c/users/*/.minecraft"):
+        hb = Path(str(HOME)) if isinstance(HOME, (str, Path)) else user_home()
+        for mc in hb.glob("*/*/drive_c/users/*/.minecraft"):
             if _looks_minecraft(mc):
                 roots.append(mc.resolve())
     except Exception as e:

@@ -19,13 +19,11 @@ modules/wine.py — легаси-Wine путь (Linux/РЕД ОС), сохран
 Все пути читаются из модуля КАК АТРИБУТЫ (wine.WINE_DIR и т.д.), поэтому
 тесты могут подменять их monkeypatch-ом без перезапуска процесса.
 """
-import os
 import shutil
-import subprocess
 from pathlib import Path
 
-from modules import debug, net, prefix, state
-from modules.colors import ok, info, warn, err, hint
+from modules import debug, net, prefix
+from modules.colors import ok, info, err
 from modules.config import (
     WINE_DIR, WINE_BIN, RUNEXE, DXVK_DIR, DEFAULT_PREFIX,
     WINE_MIRRORS, DXVK_VERSIONS, DXVK_OVERRIDES, make_dxvk_mirrors,
