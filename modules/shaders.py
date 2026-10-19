@@ -625,9 +625,12 @@ def _heaviness_of(name: str, meta: dict = None) -> float:
         if key in low:
             # Sildur's имеет варианты Lite/Medium/Extreme — уточняем по имени
             if key == "sildur":
-                if "lite" in low: return 3.0
-                if "medium" in low: return 6.0
-                if "high" in low or "extreme" in low: return 8.5
+                if "lite" in low:
+                    return 3.0
+                if "medium" in low:
+                    return 6.0
+                if "high" in low or "extreme" in low:
+                    return 8.5
             if key == "chocapic13" and "v9 lite" in low:
                 return 2.0
             return val

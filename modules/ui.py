@@ -473,35 +473,9 @@ def main():
         sys.exit(1)
 
     from modules.platform_utils import IS_WINDOWS
-    if not IS_WINDOWS:
-        # Linux/РЕД ОС: Wine/DXVK/winetricks нужны — проверяем хост до загрузки
-        try:
-            check_host_deps()
-        except Exception as e:
-            debug.dbg_exc(e, "main/check_host_deps")
-    if IS_WINDOWS:
-        # ── Нативный путь Windows 10: Wine/DXVK/winetricks не нужны вовсе ──
-        java_bin, java_home, java_status = find_java()
-        if java_home or java_bin:
-            ok(f"Java найдена: {java_home or java_bin}")
-        else:
-            warn(f"Java: {java_status}")
-            hint("Legacy/FO установятся автоматически — или введи: install-java")
-        mc_dirs = find_minecraft_dirs(limit=5)
-        if mc_dirs:
-            ok(f"Игровые директории: {len(mc_dirs)} (свежая: {mc_dirs[0]})")
-        else:
-            hint("Установок Minecraft пока нет. Начни с команды: legacy "
-                 "(лаунчер) → скачай версию → fo (модпак) → shaders (шейдеры).")
-        print_diagnostics()
-        print_help()
-        sep()
-        print(f"{GREEN}Готово!{RESET} Пиши команду (legacy / fo / shaders / minecraft / help).")
-        if state.DEBUG_MODE:
-            hint("Дебаг вкл. При проблеме: `debugreport`")
-        print()
-    else:
-        # Linux/РЕД ОС: wine-путь сохранён для совместимости
+
+    def _linux_wine_boot():
+        """Linux/РЕД ОС: Wine-путь сохранён для совместимости."""
         try:
             check_host_deps()
         except Exception as e:
@@ -540,6 +514,55 @@ def main():
         if state.DEBUG_MODE:
             hint("Дебаг включён. При проблеме: `debugreport`")
         print()
+
+    if IS_WINDOWS:
+        # ── Нативный путь Windows 10: Wine/DXVK/winetricks не нужны вовсе ──
+        java_bin, java_home, java_status = find_java()
+        if java_home or java_bin:
+            ok(f"Java найдена: {java_home or java_bin}")
+        else:
+            warn(f"Java: {java_status}")
+            hint("Legacy/FO установятся автоматически — или введи: install-java")
+        mc_dirs = find_minecraft_dirs(limit=5)
+        if mc_dirs:
+            ok(f"Игровые директории: {len(mc_dirs)} (свежая: {mc_dirs[0]})")
+        else:
+            hint("Установок Minecraft пока нет. Начни с команды: legacy "
+                 "(лаунчер) → скачай версию → fo (модпак) → shaders (шейдеры).")
+        print_diagnostics()
+        print_help()
+        sep()
+        print(f"{GREEN}Готово!{RESET} Пиши команду (legacy / fo / shaders / minecraft / help).")
+        if state.DEBUG_MODE:
+            hint("Дебаг вкл. При проблеме: `debugreport`")
+        print()
+    else:
+        _linux_wine_boot()
+
+    # Общий REPL-цикл для обеих платформ. Перед выходом останавливаем все
+    # запущенные игры и показываем их статус (stop_all_games + gamestate).
+    if gamestate.running():
+        for line in gamestate.status_lines():
+            info(line)
+    last_exe = None
+    try:
+        while True:
+            try:
+                prompt = f"{CYAN}mc>{RESET} "
+                try:
+                    name = input(prompt).strip()
+                except EOFError:
+                    break
+            except KeyboardInterrupt:
+                print()
+                continue
+            if not name:
+                continue
+            last_exe, cont = process_input(name, last_exe)
+            if not cont:
+                break
+    finally:
+        stop_all_games()
 
 
 

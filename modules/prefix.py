@@ -37,7 +37,6 @@ def _looks_minecraft(p: Path) -> bool:
 
 def native_minecraft_roots() -> list:
     """Все известные расположения .minecraft на этой машине (без сортировки)."""
-    roots = []
     if IS_WINDOWS:
         appdata = user_home() / "AppData" / "Roaming"
         cand = [appdata / ".minecraft"]
@@ -86,9 +85,33 @@ def native_minecraft_roots() -> list:
     return out
 
 
+def _in_worlds_backup(p: Path) -> bool:
+    """True, если путь лежит внутри папки-бэкапа миров (minecraft-worlds /
+    world-backup). Такие копии — не живые установки: их нельзя предлагать
+    как игровую директорию и целевую папку saves."""
+    try:
+        parts = {q.lower() for q in Path(p).parts}
+    except Exception:
+        return False
+    return ("minecraft-worlds" in parts or "world-backup" in parts
+            or "worlds-backup" in parts)
+
+
 def find_minecraft_dirs(limit: int = 12) -> list:
     """Список путей .minecraft, отсортированных по свежести использования."""
-    roots = native_minecraft_roots()
+    roots = [r for r in native_minecraft_roots() if not _in_worlds_backup(r)]
+    # дополняем shallow-поиск: HOME/*/.minecraft (Prism/ATL/MultiMC и т.п.)
+    try:
+        base = user_home()
+        if base.is_dir():
+            for d in base.iterdir():
+                if d.is_dir():
+                    cand = d / ".minecraft"
+                    if cand.is_dir() and not _in_worlds_backup(cand) \
+                            and _looks_minecraft(cand):
+                        roots.append(cand.resolve())
+    except OSError as e:
+        debug.dbg_exc(e, "prefix.find_minecraft_dirs.shallow")
 
     def mtime(p: Path) -> float:
         best = p.stat().st_mtime
@@ -101,8 +124,14 @@ def find_minecraft_dirs(limit: int = 12) -> list:
             pass
         return best
 
-    roots.sort(key=mtime, reverse=True)
-    return roots[:limit]
+    uniq, seen = [], set()
+    for r in roots:
+        k = str(r).lower()
+        if k not in seen:
+            seen.add(k)
+            uniq.append(r)
+    uniq.sort(key=mtime, reverse=True)
+    return uniq[:limit]
 
 
 def latest_used_dir():

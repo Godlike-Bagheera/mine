@@ -8,6 +8,7 @@ Windows 10, а Wine/DXVK/префиксы не нужны вовсе. Всё, ч
 """
 import os
 import sys
+import shutil
 import subprocess
 from pathlib import Path
 

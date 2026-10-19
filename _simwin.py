@@ -1,5 +1,7 @@
 # Симуляция запуска на Windows 10 (для проверки пути IS_WINDOWS под Linux)
-import os, sys
+import os
+import sys
+
 sys.path.insert(0, '.')
 os.name = 'nt'
 os.environ['USERPROFILE'] = '/tmp/fakehome'
@@ -9,9 +11,10 @@ import modules.platform_utils as pu
 assert pu.IS_WINDOWS is True, "IS_WINDOWS should be True"
 # entry point
 try:
-    import wine
+    import wine  # noqa: F401
 except SystemExit as e:
-    print("SystemExit:", e.code); sys.exit(0)
+    print("SystemExit:", e.code)
+    sys.exit(0)
 from modules.ui import main as ui_main
 sys.argv = ['wine.py']
 try:
