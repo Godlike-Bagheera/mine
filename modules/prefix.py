@@ -28,7 +28,10 @@ def _looks_minecraft(p: Path) -> bool:
                        ".minecraft"):
             if (p / marker).exists():
                 return True
-        # portable-установка Legacy: versions есть, остальное допустимо пусто
+        # portable-инстанты лаунчеров (Legacy/Prism): versions непустой ИЛИ
+        # есть saves — иначе пустые portable-корни не находились совсем
+        if (p / "saves").is_dir():
+            return True
         return any((p / "versions").iterdir())
     except Exception as e:
         debug.dbg_exc(e, f"prefix._looks_minecraft({p})")
@@ -101,12 +104,20 @@ def find_minecraft_dirs(limit: int = 12) -> list:
     """Список путей .minecraft, отсортированных по свежести использования."""
     roots = [r for r in native_minecraft_roots() if not _in_worlds_backup(r)]
     # дополняем shallow-поиск: HOME/*/.minecraft (Prism/ATL/MultiMC и т.п.)
+    # и инстанты лаунчеров по общепринятым именам папок: HOME/<Имя>/.minecraft,
+    # HOME/<Имя>/minecraft (например HOME/Prism/.minecraft).
     try:
         base = user_home()
         if base.is_dir():
             for d in base.iterdir():
-                if d.is_dir():
-                    cand = d / ".minecraft"
+                if not d.is_dir():
+                    continue
+                cands = []
+                if d.name.lower().startswith(".minecraft"):
+                    cands.append(d)
+                for sub in (".minecraft", "minecraft"):
+                    cands.append(d / sub)
+                for cand in cands:
                     if cand.is_dir() and not _in_worlds_backup(cand) \
                             and _looks_minecraft(cand):
                         roots.append(cand.resolve())
