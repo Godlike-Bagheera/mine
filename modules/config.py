@@ -322,6 +322,18 @@ LEGACY_MIRRORS = [
      "https://archive.org/download/legacy-launcher-for-minecraft/LegacyLauncher_Installer_legacy.exe"),
 ]
 
+PRISM_WIN_URLS = [
+    ("GitHub (прямой)",
+     "https://github.com/PrismLauncher/PrismLauncher/releases/download/"
+     "7.2/PrismLauncher-Windows-MSVC-QT6-Setup-7.2.exe"),
+    ("ghfast.top",
+     "https://ghfast.top/https://github.com/PrismLauncher/PrismLauncher/releases/download/"
+     "7.2/PrismLauncher-Windows-MSVC-QT6-Setup-7.2.exe"),
+    ("ghproxy.net",
+     "https://ghproxy.net/https://github.com/PrismLauncher/PrismLauncher/releases/download/"
+     "7.2/PrismLauncher-Windows-MSVC-QT6-Setup-7.2.exe"),
+]
+
 LEGACY_URL = LEGACY_MIRRORS[0][1]
 
 # ─────────────────────────────────────────────────────────────

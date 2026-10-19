@@ -23,7 +23,7 @@ import shutil
 from pathlib import Path
 
 from modules import debug, net, prefix
-from modules.colors import ok, info, err
+from modules.colors import ok, info, err, hint
 from modules.config import (
     WINE_DIR, WINE_BIN, RUNEXE, DXVK_DIR, DEFAULT_PREFIX,
     WINE_MIRRORS, DXVK_VERSIONS, DXVK_OVERRIDES, make_dxvk_mirrors,
@@ -181,6 +181,22 @@ def cmd_dxvk():
 
 def cmd_update():
     """Команда 'update': полная перепроверка Wine + DXVK с подтверждением."""
+    from modules.platform_utils import IS_WINDOWS
+    if IS_WINDOWS:
+        # Wine/DXVK на Windows 10 не используются (всё нативное) —
+        # бессмысленное скачивание Wine-AppImage убрано. Обновляем только
+        # сам скрипт из репозитория.
+        try:
+            ans = input("Обновить скрипт из GitHub? (да/нет): ").strip().lower()
+        except EOFError:
+            return
+        if ans not in ("y", "yes", "д", "да"):
+            info("Пропущено.")
+            return
+        ok("Wine/DXVK на Windows не нужны — обновление их пропущено.")
+        hint("Для обновления кода: git pull в папке установки, либо скачай "
+             "свежий install.cmd")
+        return
     try:
         ans = input("Обновить Wine и DXVK? (да/нет): ").strip().lower()
     except EOFError:

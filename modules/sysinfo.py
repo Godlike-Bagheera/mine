@@ -283,5 +283,13 @@ def format_summary(hw: dict) -> str:
     return "\n".join(lines)
 
 
+# Алиасы публичного API: ui.py и внешние вызывающие места используют имена
+# get_hardware / format_hw. Раньше их не существовало — диагностика железа
+# на Windows падала с ImportError (исключение ловилось, но пользователь
+# видел лишь «Не удалось собрать инфо о железе»).
+get_hardware = hardware_summary
+format_hw = format_summary
+
+
 if __name__ == "__main__":  # быстрая самопроверка: python -m modules.sysinfo
-    print(format_summary(hardware_summary()))
+    print(format_hw(get_hardware()))

@@ -302,7 +302,18 @@ def _tts_say(text):
     except Exception as e:
         debug.dbg_exc(e, "launcher")
 def _build_cmd(path, use_gm):
+    from modules.platform_utils import IS_WINDOWS
     suffix = path.suffix.lower()
+    if IS_WINDOWS:
+        # На Windows 10 всё нативное: .exe/.bat запускаем напрямую,
+        # .msi — через msiexec. wine-ветка ниже только для Linux/РЕД ОС.
+        if suffix == ".msi":
+            base_cmd = ["msiexec", "/i", str(path)]
+        elif suffix in (".bat", ".cmd"):
+            base_cmd = [str(path)]
+        else:
+            base_cmd = [str(path)]
+        return base_cmd
     if suffix == ".lnk":
         base_cmd = [str(WINE_BIN), "start", "/unix", str(path)]
     elif suffix == ".msi":
@@ -474,6 +485,49 @@ def launch(path, engine=None):
     log_path = get_log_path(path)
     settings = load_settings()
     use_gm = settings.get("use_gamemode", False) and gamemode_available()
+
+    from modules.platform_utils import IS_WINDOWS
+    if IS_WINDOWS:
+        # Нативный запуск .exe на Windows 10 — без Wine/префикса/DXVK.
+        info(f"Движок: {BOLD}нативный Windows{RESET} (без Wine)")
+        info(f"Запускаю: {path}")
+        hint(f"Лог: {log_path}")
+        print()
+        _tts_say(f"Запускаю {path.stem}")
+        cmd = _build_cmd(path, use_gm)
+        debug.dbg(f"Launch(win): {cmd}")
+        start_time = time.time()
+        try:
+            logf = open(log_path, "w", encoding="utf-8", errors="replace")
+        except OSError as e:
+            err(f"Не могу создать лог: {e}")
+            return
+        try:
+            proc = subprocess.Popen(
+                cmd, cwd=str(path.parent),
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, encoding="utf-8", errors="replace",
+            )
+        except Exception as e:
+            debug.dbg_exc(e, "launch/win-Popen")
+            err(f"Ошибка запуска: {e}")
+            try:
+                logf.close()
+            except OSError:
+                pass
+            update_history(path, status="crash", duration=time.time() - start_time)
+            return
+        name = _unique_name(path.stem)
+        _taken_names.add(name)
+        gamestate.register(name, proc, path, log=log_path)
+        t = threading.Thread(target=_watch_game,
+                             args=(proc, logf, path, name, log_path, start_time),
+                             daemon=True, name=f"gamewatch-{name}")
+        t.start()
+        ok(f"Игра '{name}' запущена в фоне — терминал доступен.")
+        hint("Команды: gamestatus, stopgame <имя|all>, waitgame <имя>, games")
+        return
+
     info(f"Движок: {BOLD}Wine{RESET}")
     if use_gm:
         info(f"GameMode: {BOLD}включён{RESET}")

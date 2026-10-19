@@ -262,7 +262,27 @@ def _find_prism_exe():
 
 
 def setup_prism():
+    from modules.platform_utils import IS_WINDOWS
     info(f"{BOLD}Установка Prism Launcher{RESET}")
+
+    if IS_WINDOWS:
+        # На Windows .tar.gz с Linux-бинарником бесполезен — качаем
+        # нативный Windows-инсталлятор .exe и запускаем его.
+        from modules.config import PRISM_WIN_URLS
+        dest = Path.home() / "Downloads" / "PrismLauncher-Setup.exe"
+        if not download_file(PRISM_WIN_URLS, dest, "Prism Launcher (Windows)",
+                             min_size_mb=10):
+            err("Не удалось скачать Prism Launcher для Windows")
+            return False
+        ok(f"Prism скачан: {dest}")
+        hint("Запускаю установщик — подтверди установку в окне...")
+        try:
+            subprocess.Popen([str(dest)], shell=False)
+        except Exception as e:
+            debug.dbg_exc(e, "setup_prism/win-run")
+            hint(f"Или запусти вручную: {dest}")
+        return True
+
     archive = WINE_DIR / "prism.tar.gz"
     # Зеркала: раньше качали ТОЛЬКО напрямую с github.com — в медленных/
     # блокирующих сетях Prism не скачивался вообще. Добавлены прокси-зеркала

@@ -83,6 +83,13 @@ elif hasattr(os, "geteuid") and os.geteuid() == 0:
 
 
 def main():
+    # ANSI-цвета в cmd.exe Windows 10 без этого не работают (куски \033[...m
+    # печатались бы как мусор). На Linux/Windows Terminal — no-op.
+    try:
+        from modules.platform_utils import enable_vt
+        enable_vt()
+    except Exception:
+        pass
     from modules.ui import main as ui_main
     ui_main()
 

@@ -7,7 +7,7 @@ import urllib.request
 import urllib.error       # <-- добавляем для HTTPError
 from pathlib import Path
 from modules import state, debug, net
-from modules.colors import ok, info, warn, err, CYAN, RESET
+from modules.colors import ok, info, warn, err, hint, CYAN, RESET
 from modules.config import (
     MIN_SPEED_KB, SPEED_TEST_SECONDS, CONNECT_TIMEOUT,
     SPEED_CHECK_MIN_MB, SLOW_MODE_AFTER,
@@ -109,13 +109,47 @@ def open_checked(req, timeout):
         reason = getattr(e, "reason", None)
         cert_bad = isinstance(reason, ssl.SSLCertVerificationError) or \
             "CERTIFICATE_VERIFY_FAILED" in str(reason)
-        if cert_bad and not _insecure_fallback_allowed():
-            warn(f"SSL: сертификат не прошёл проверку ({getattr(reason, 'verify_message', reason)}). "
-                 "Фолбек без проверки сертификатов ОТКЛЮЧён по соображениям безопасности. "
-                 "Если сеть использует MITM-прокси с корнем Минцифры — установите его корневой "
-                 "сертификат в доверие системы; крайний вариант: WI_INSECURE_SSL=1 (небезопасно).")
-            debug.dbg(f"open-checked-cert-error (no fallback): {req.full_url}", level="WARN")
+        if cert_bad:
+            from modules.platform_utils import IS_WINDOWS
+            if IS_WINDOWS:
+                # На Windows Python 3.12+ использует OpenSSL и НЕ видит
+                # системное хранилище сертификатов Windows — любое HTTPS
+                # падает с CERTIFICATE_VERIFY_FAILED, даже когда браузер
+                # всё открывает нормально. Подхватываем корни из реестра
+                # Windows через ssl.create_default_context(cafile=
+                # 'winstore:///ROOT') (Python 3.12+) либо certifi.
+                hint("SSL: сертификат не прошёл проверку — пробую системное "
+                     "хранилище Windows / certifi...")
+                ctx = _windows_ctx()
+                if ctx is not None:
+                    try:
+                        return urllib.request.urlopen(req, context=ctx,
+                                                      timeout=timeout)
+                    except urllib.error.URLError:
+                        pass  # падаем в стандартное сообщение ниже
+            if not _insecure_fallback_allowed():
+                warn(f"SSL: сертификат не прошёл проверку ({getattr(reason, 'verify_message', reason)}). "
+                     "Фолбек без проверки сертификатов ОТКЛЮЧён по соображениям безопасности. "
+                     "Если сеть использует MITM-прокси — добавьте его корень "
+                     "в доверие системы; крайний вариант: WI_INSECURE_SSL=1 (небезопасно).")
+                debug.dbg(f"open-checked-cert-error (no fallback): {req.full_url}", level="WARN")
         raise
+
+
+def _windows_ctx():
+    """SSL-контекст с корнями из хранилища Windows (или certifi)."""
+    for kwargs in ({"cafile": "winstore:///ROOT"}, {}):
+        try:
+            ctx = ssl.create_default_context(**kwargs)
+            return ctx
+        except Exception as e:
+            debug.dbg(f"_windows_ctx({kwargs}): {e}", level="WARN")
+    try:  # последний разумный фолбек — пакет certifi (строгий!)
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception as e:
+        debug.dbg(f"_windows_ctx/certifi: {e}", level="WARN")
+    return None
 
 
 def head_check(url, timeout=15):
