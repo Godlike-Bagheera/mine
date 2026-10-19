@@ -28,3 +28,4 @@
 *.bundle binary
 *.ico   binary
 *.pdf   binary
+install.cmd -text eol=crlf
