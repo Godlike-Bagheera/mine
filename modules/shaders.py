@@ -724,8 +724,13 @@ def cmd_shaders(arg=""):
         hw = None
     rec = recommend_shader(hw) if hw else None
     if rec:
+        # В каталоге RECOMMENDATIONS ключ называется tier_max (верхняя граница
+        # мощности ПК для пака); hw-класс — отдельное поле. Раньше здесь
+        # читался несуществующий rec['tier'] -> KeyError и вся команда shaders
+        # падала на Windows прямо после вывода информации о железе.
+        klass = hw.get("tier", "?") if hw else "?"
         ok(f"Рекомендация под твоё ПК: {CYAN}{rec['name']}{RESET} "
-           f"(класс «{rec['tier']}», нагрузка ~{rec['heaviness']}/10)")
+           f"(класс «{klass}», нагрузка ~{rec['heaviness']}/10)")
         hint(rec["desc"])
 
     mc, version = pick_target_mc()
