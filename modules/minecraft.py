@@ -392,8 +392,10 @@ def setup_legacy_portable():
         #    браузерных заголовков («в браузере открывается» ≠ «urlopen
         #    работает»: у urllib другой TLS-фингерпринт и UA).
         info("Скачиваю Legacy Launcher Portable...")
-        mirrors = [("api.legacylauncher.net", LEGACY_JAR_URL_API)] + \
-            list(LEGACY_JAR_MIRRORS)
+        # api.legacylauncher.net в конце: домен стабильно не резолвится
+        # (getaddrinfo failed) и только тратит очередь зеркал.
+        mirrors = list(LEGACY_JAR_MIRRORS) + \
+            [("api.legacylauncher.net", LEGACY_JAR_URL_API)]
         downloaded = download_file(
             mirrors, jar_path,
             "Legacy Launcher Portable",

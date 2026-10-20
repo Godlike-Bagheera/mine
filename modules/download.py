@@ -1,8 +1,11 @@
 """Скачивание с мультизеркал, докачкой, slow-mode, aria2c, HEAD-проверкой."""
+import http.client
 import os
+import socket
 import ssl
 import time
 import subprocess
+import urllib.parse
 import urllib.request
 import urllib.error       # <-- добавляем для HTTPError
 from pathlib import Path
@@ -92,6 +95,123 @@ def _insecure_fallback_allowed():
     return os.environ.get("WI_INSECURE_SSL") == "1"
 
 
+# Полностью браузерный набор заголовков. Часть CDN (в т.ч. Legacy Launcher)
+# рвёт соединение (WinError 10054 / ECONNRESET) на запросы, где TLS-рукопожатие
+# выдаёт «питоновский» фингерпринт и минимальный набор заголовков.
+_BROWSER_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/124.0.0.0 Safari/537.36"),
+    "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+               "image/avif,image/webp,*/*;q=0.8"),
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Connection": "close",   # keep-alive не нужен: читаем один поток до конца
+}
+
+
+def _browser_headers(req):
+    """Дописывает в запрос недостающие браузерные заголовки."""
+    have = {k.lower() for k, _ in req.header_items()}
+    for key, val in _BROWSER_HEADERS.items():
+        if key.lower() not in have:
+            req.add_header(key, val)
+    return req
+
+
+class _RawSSLOpenResponse:
+    """Обёртка над http.client.HTTPResponse для ответа, полученного через
+    прямой ssl-сокет (_open_raw). Интерфейс совпадает с тем, что использует
+    try_download_manual/head_check: .status, .headers.get(), .read(), .close().
+    """
+
+    def __init__(self, resp, sock):
+        self._resp = resp
+        self._sock = sock
+        self.status = resp.status
+        self.headers = resp.headers
+
+    def read(self, n=-1):
+        return self._resp.read(n)
+
+    def close(self):
+        try:
+            self._resp.close()
+        except Exception:
+            pass
+        try:
+            self._sock.close()
+        except Exception:
+            pass
+
+
+def _open_raw(req, timeout, _depth=0):
+    """Запасной путь: HTTPS-запрос через прямой ssl+http.client сокет.
+
+    urllib.request прокидывает в ssl.SSLContext только ALPN (h2/h1.1) и SNI —
+    всё остальное (CHROME-style перестановка эллиптических кривых,
+    signature_algorithms, supported_versions) Python не позволяет задать без
+    третьих библиотек. Поэтому даже идентичные User-Agent и заголовки иногда
+    приводят к RST от CDN, а браузер в это же время качает нормально.
+    Здесь мы хотя бы убираем ALPN (только HTTP/1.1) и Connection: close —
+    иногда этого достаточно. Проверка сертификата остаётся строгой.
+    Redirect (3xx + Location) отрабатывается рекурсией (до 5 раз).
+    """
+    url = urllib.parse.urlsplit(req.full_url)
+    if url.scheme != "https":
+        raise urllib.error.URLError("raw-fallback умеет только https")
+    port = url.port or 443
+    ctx = ssl.create_default_context()
+    try:
+        ctx.set_alpn_protocols(["http/1.1"])
+    except (NotImplementedError, AttributeError):
+        pass
+    host = url.hostname
+    conn = None
+    try:
+        raw = socket.create_connection((host, port), timeout=timeout)
+        ssock = ctx.wrap_socket(raw, server_hostname=host)
+        conn = http.client.HTTPConnection(host, port, timeout=timeout)
+        conn.sock = ssock
+        hdrs = {k: v for k, v in req.header_items()}
+        hdrs.setdefault("Host", host)
+        hdrs["Connection"] = "close"
+        path = url.path or "/"
+        if url.query:
+            path += "?" + url.query
+        method = "GET" if req.data is None else "POST"
+        conn.request(method, path, body=req.data, headers=hdrs)
+        resp = conn.getresponse()
+        # редиректы: urllib их сам разворачивал, здесь делаем вручную
+        if resp.status in (301, 302, 303, 307, 308) and resp.getheader("Location"):
+            loc = resp.getheader("Location")
+            new_url = urllib.parse.urljoin(req.full_url, loc)
+            debug.dbg(f"_open_raw: redirect {resp.status} -> {new_url}")
+            try:
+                resp.read()
+            except Exception:
+                pass
+            resp.close()
+            ssock.close()
+            if _depth >= 5:
+                raise urllib.error.URLError("слишком много редиректов (raw)")
+            nreq = urllib.request.Request(new_url, data=req.data,
+                                          method=method)
+            for k, v in hdrs.items():
+                if k.lower() not in ("host", "connection"):
+                    nreq.add_header(k, v)
+            return _open_raw(nreq, timeout, _depth + 1)
+        return _RawSSLOpenResponse(resp, ssock)
+    except Exception as e:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        reason = e if isinstance(e, OSError) else \
+            urllib.error.URLError(e)
+        raise reason
+
+
 def open_checked(req, timeout):
     """urlopen с единым (строгим) SSL-контекстом net.ssl_ctx().
 
@@ -101,10 +221,24 @@ def open_checked(req, timeout):
     убран как дыра в безопасности; вместо него при SSL ошибках печатается
     понятная подсказка. Insecure-режим включается ТОЛЬКО явно:
     WI_INSECURE_SSL=1 (тогда net.ssl_ctx сам строит CERT_NONE-контекст).
+
+    Если обычное соединение разорвано (WinError 10054 / ECONNRESET /
+    RemoteDisconnected — так ведут себя CDN против «небраузерных» клиентов),
+    автоматически делается вторая попытка: браузерные заголовки + прямой
+    ssl-сокет без ALPN (_open_raw).
     """
+    _browser_headers(req)
     try:
         return urllib.request.urlopen(req, context=net.ssl_ctx(),
                                       timeout=timeout)
+    except (ConnectionResetError, http.client.RemoteDisconnected,
+            BrokenPipeError, socket.timeout) as e:
+        debug.dbg(f"open-checked reset ({e!r}), пробую raw-сокет: "
+                  f"{req.full_url}", level="WARN")
+        try:
+            return _open_raw(req, timeout)
+        except Exception as e2:
+            raise urllib.error.URLError(e2) from e2
     except urllib.error.URLError as e:
         reason = getattr(e, "reason", None)
         cert_bad = isinstance(reason, ssl.SSLCertVerificationError) or \
@@ -206,8 +340,23 @@ def try_download_manual(name, url, dest, silent=False):
     try:
         req = urllib.request.Request(url, headers=headers)
         r = open_checked(req, CONNECT_TIMEOUT)
-    except urllib.error.HTTPError as e:
-        if e.code == 416 and existing > 0:
+    except urllib.error.URLError as e:
+        # HTTPError — подкласс URLError, у него есть .code; у обычного
+        # URLError (DNS, reset, timeout) кода нет — берём через getattr.
+        code = getattr(e, "code", None)
+        if isinstance(getattr(e, "reason", None), ConnectionResetError):
+            # open_checked уже сделал raw-попытку и она тоже упала в reset —
+            # ещё один заход с тем же URL иногда проходит (CDN-флэпы).
+            debug.dbg(f"reset на {name}, повторяю запрос")
+            try:
+                req = urllib.request.Request(url, headers=headers)
+                r = open_checked(req, CONNECT_TIMEOUT)
+            except Exception as e2:
+                debug.dbg_exc(e2, f"connect-retry/{name}")
+                if not silent:
+                    err(f"  Не подключиться: {e2}")
+                return False
+        elif code == 416 and existing > 0:
             # 416 = Range за пределами файла. Значит файл уже полный
             # (или битый). Удаляем и пробуем с нуля без Range.
             debug.dbg(f"416 на {name}, удаляю файл и начинаю с нуля")
