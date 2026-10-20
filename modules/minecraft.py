@@ -407,9 +407,50 @@ def _prism_zip_ok(path, min_mb=10):
         return False
 
 
+def _prism_icu_broken(exe):
+    """True, если рядом с prismlauncher.exe НЕТ ни одного icu*.dll.
+
+    Именно такой запуск даёт «системная ошибка: не обнаружена icu.DLL».
+    """
+    return not _prism_has_icu(exe)
+
+
+def _launch_prism_exe(exe):
+    from modules.platform_utils import IS_WINDOWS
+    if IS_WINDOWS and _prism_icu_broken(exe):
+        err("Этот prismlauncher.exe запускается с ошибкой «не обнаружена "
+            "icu.DLL»: рядом нет icu*.dll (Setup/MinGW-сборка или exe "
+            "скопирован без DLL). Нужен Portable zip целиком.")
+        hint(f"Папка лаунчера: {Path(exe).parent}")
+        return False
+    try:
+        subprocess.Popen([str(exe)], cwd=str(Path(exe).parent))
+        ok(f"Запускаю Prism: {exe}")
+        return True
+    except Exception as e:
+        debug.dbg_exc(e, "_launch_prism_exe")
+        hint(f"Запусти вручную двойным кликом: {exe}")
+        return False
+
+
 def setup_prism():
     from modules.platform_utils import IS_WINDOWS
     info(f"{BOLD}Установка Prism Launcher{RESET}")
+
+    # 0.5) Уже распакованный рабочий portable в PRISM_DIR? Предлагать запуск
+    # ДО любых сетевых операций — сеть школы может блокировать скачивание,
+    # а лаунчер уже лежит на диске. Битый (без icu*.dll) не запускаем и
+    # честно говорим почему.
+    if IS_WINDOWS:
+        try:
+            prev_exe = _find_prism_exe()
+        except Exception as e:
+            debug.dbg_exc(e, "setup_prism/prev-exe-early")
+            prev_exe = None
+        if prev_exe and _prism_has_icu(prev_exe):
+            ok(f"Prism уже установлен (portable): {prev_exe}")
+            _launch_prism_exe(prev_exe)
+            return True
 
     if IS_WINDOWS:
         # На Windows .tar.gz с Linux-бинарником бесполезен — качаем
@@ -880,6 +921,29 @@ def setup_legacy():
     warn("Wine-установщик Legacy Launcher известен крашем на Wine 11 (WOW64)")
     info("Использую Portable (.jar) — работает без Wine")
     print()
+
+    # Windows: если в сети RST-блокировка Python-TLS, питоновские попытки
+    # в setup_legacy_portable падают на всех зеркалах. Сначала быстро
+    # прогоняем curl.exe по всей очереди сам; скачанный jar затем увидит
+    # _find_local_legacy_jar() и setup_legacy_portable отработает офлайн.
+    if _IS_WIN:
+        from modules.download import download_queue_with_curl
+        jar_dir = WINE_DIR / "legacy-portable"
+        jar_dir.mkdir(parents=True, exist_ok=True)
+        cand = jar_dir / "LegacyLauncher.jar"
+        if not (cand.exists() and cand.stat().st_size >= LEGACY_JAR_MIN_SIZE
+                and _looks_like_jar(cand)):
+            mirrors = legacy_jar_mirrors(True)
+            dl_url = download_queue_with_curl(mirrors, cand,
+                                              min_bytes=LEGACY_JAR_MIN_SIZE)
+            if dl_url and cand.exists() and _looks_like_jar(cand):
+                ok(f"Legacy Launcher (.jar) скачан через curl: {dl_url}")
+            elif cand.exists():
+                try:
+                    cand.unlink()   # огрызок/HTML — мешается под кэшем
+                except OSError:
+                    pass
+
     good = setup_legacy_portable()
     if not good and _IS_WIN:
         # На Windows сеть может рвать и TLS, и Java-запросы лаунчера.

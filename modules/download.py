@@ -342,20 +342,32 @@ def download_via_curl(url, dest, timeout=CONNECT_TIMEOUT * 4):
     tmp = Path(str(dest) + ".curlpart")
     # --retry: CDN-редиректы GitHub и зеркала часто отдают разовый сбой;
     # без повторов curl падал молча, и весь фолбек считался неудачным.
-    cmd = [exe, "--fail", "--location", "--tlsv1.2",
+    # --http1.1: HTTP/2 у Schannel/curl на Windows в некоторых сетях даёт
+    # ошибки рукопожатия там, где HTTP/1.1 проходит.
+    cmd = [exe, "--fail", "--location", "--http1.1",
            "--retry", "2", "--retry-delay", "1",
            "--connect-timeout", str(timeout // 4 or 15),
            "--max-time", str(timeout),
-           "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+           "--user-agent", ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/124.0.0.0 Safari/537.36"),
            "--output", str(tmp), url]
     debug.dbg(f"curl fallback: {' '.join(cmd)}")
     try:
-        r = subprocess.run(cmd, check=False, timeout=timeout + 30,
+        r = subprocess.run(cmd, check=False, timeout=timeout + 90,
                            stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL)
+                           stderr=subprocess.PIPE)
         if r.returncode == 0 and tmp.exists() and tmp.stat().st_size > 0:
             os.replace(tmp, dest)
             return True
+        errtxt = ""
+        try:
+            errtxt = (r.stderr or b"").decode("utf-8", errors="ignore") \
+                .strip().splitlines()[-1:] or [""]
+            errtxt = errtxt[0] if errtxt else ""
+        except Exception:
+            pass
+        debug.dbg(f"curl rc={r.returncode}: {errtxt}", level="WARN")
     except Exception as e:
         debug.dbg(f"curl fallback failed: {e}", level="WARN")
     try:
@@ -364,6 +376,39 @@ def download_via_curl(url, dest, timeout=CONNECT_TIMEOUT * 4):
     except Exception:
         pass
     return False
+
+
+def download_queue_with_curl(mirrors, dest, min_bytes=1024, silent=False):
+    """Прогоняет curl.exe по ВСЕЙ очереди зеркал.
+
+    В школьных сетях DPI рвёт TLS-рукопожатие Python (WinError 10054) на
+    всех доменах сразу, а curl/Schannel идёт через системное хранилище
+    сертификатов и прокси — как браузер. Возвращает URL зеркала, с которого
+    файл реально скачан (размер >= min_bytes), либо None. Используется как
+    ПЕРВЫЙ путь на Windows: питоновские попытки при RST-блокировке только
+    жгут время и выводят пользователя из себя длинными списками ошибок.
+    """
+    if not shutil_which_curl():
+        return None
+    for name, url in mirrors:
+        try:
+            if dest.exists() and dest.stat().st_size >= max(min_bytes, 1024):
+                return url
+        except OSError:
+            pass
+        if not silent:
+            info(f"Пробую закачку через curl.exe: {CYAN}{name}{RESET}")
+        timeout = CONNECT_TIMEOUT * 4
+        if download_via_curl(url, dest, timeout=timeout):
+            try:
+                if dest.stat().st_size >= max(min_bytes, 1024):
+                    ok(f"  Готово (curl): "
+                       f"{dest.stat().st_size / 1024 / 1024:.1f} МБ")
+                    return url
+                warn("  curl скачал слишком мало — пробую следующее зеркало")
+            except OSError:
+                pass
+    return None
 
 
 def shutil_which_curl():
@@ -725,6 +770,22 @@ def download_file(mirrors, dest, label, min_size_mb=10, silent=False,
     if not silent:
         info(f"Скачиваю {label}...\n")
     mirrors_sorted = sort_mirrors_by_cache(mirrors)
+    # Windows: сначала curl.exe по всей очереди. В сетях с RST-блокировкой
+    # Python-TLS питоновские попытки падают на ВСЕХ зеркалах и печатают
+    # простыню ошибок, а curl (Schannel/системный прокси) качает как браузер.
+    # Если curl нет или не смог — идем дальше стандартным путем (Python).
+    from modules.platform_utils import IS_WINDOWS as _IS_WIN_EARLY
+    if _IS_WIN_EARLY and (not dest.exists() or not _size_ok(dest)):
+        dl_url = download_queue_with_curl(mirrors_sorted, dest,
+                                          min_bytes=min_size, silent=silent)
+        if dl_url and dest.exists() and _size_ok(dest) \
+                and _looks_binary(dest):
+            return True
+        if dest.exists() and not _looks_binary(dest):
+            try:
+                dest.unlink()
+            except Exception:
+                pass
     if get_aria2c_path() and min_size_mb >= 5 and (not dest.exists() or dest.stat().st_size == 0):
         name, url = mirrors_sorted[0]
         ok_head, size = head_check(url)

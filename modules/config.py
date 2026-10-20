@@ -338,15 +338,6 @@ _PRISM_WIN_BASE = ("https://github.com/PrismLauncher/PrismLauncher/releases/"
 # MSVC-Portable zip лежат icu*.dll рядом с exe.
 PRISM_WIN_ZIP_NAME = "PrismLauncher-Windows-MSVC-Portable-11.1.1.zip"
 PRISM_WIN_ZIP_URL = f"{_PRISM_WIN_BASE}/{PRISM_WIN_ZIP_NAME}"
-# Прямая ссылка на архив с CDN GitHub (objects.githubusercontent.com).
-# Школьные/фильтрующие сети часто рвут TLS именно к github.com, но отдают
-# редирект на objects-fallback — этот URL в очереди стоит первым, потому
-# что download_via_curl по нему НЕ проходит двойной редирект (curl без -L
-# вернул бы 302-заглушку вместо zip).
-PRISM_WIN_ZIP_DIRECT = (
-    "https://github.com/PrismLauncher/PrismLauncher/releases/download/"
-    "11.1.1/PrismLauncher-Windows-MSVC-Portable-11.1.1.zip?package_portal_"
-    "download_stable_channel=true")
 _PRISM_PROXY_PREFIXES = ("https://ghfast.top/", "https://ghproxy.net/",
                          "https://gh.llkk.cc/", "https://gh-proxy.com/")
 
@@ -356,8 +347,6 @@ _PRISM_PROXY_PREFIXES = ("https://ghfast.top/", "https://ghproxy.net/",
 # размеру zip-а; теперь download_file дополнительно сверяет точный размер и
 # магические байты PK\x03\x04 (см. _prism_zip_ok в minecraft.py).
 PRISM_WIN_URLS = [
-    # Прямой CDN-URL без редиректов — первым: его понимает и curl-фолбек.
-    ("GitHub (CDN, прямой)", PRISM_WIN_ZIP_DIRECT),
     ("GitHub (релиз)", PRISM_WIN_ZIP_URL),
     ("ghfast.top", _PRISM_PROXY_PREFIXES[0] + PRISM_WIN_ZIP_URL),
     ("ghproxy.net", _PRISM_PROXY_PREFIXES[1] + PRISM_WIN_ZIP_URL),
@@ -366,9 +355,11 @@ PRISM_WIN_URLS = [
 ]
 
 # Зеркала Legacy Launcher Portable (.jar) для Windows с учётом блокировок:
-# к официальным доменам школьные фильтры часто рвут TLS (WinError 10054),
-# а archive.org обычно проходит. Поэтому на Windows очередь начинается с
-# архивных зеркал bootstrap-.jar, официальные — следом.
+# к официальным доменам школьные фильтры часто рвут TLS (WinError 10054).
+# Порядок важен для curl-очереди (download_file на Windows сначала гоняет
+# curl.exe по всей очереди): archive.org — обычный статичный HTTPS без
+# редиректов иTLS-фиngerprint-блокировок, поэтому первым; официальные
+# домены — следом.
 LEGACY_JAR_WIN_MIRRORS = [
     ("Archive.org (bootstrap jar)",
      "https://archive.org/download/legacy-launcher-bootstrap/"
