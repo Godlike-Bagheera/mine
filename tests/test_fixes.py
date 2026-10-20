@@ -17,7 +17,8 @@ sys.path.insert(0, str(ROOT))
 os.environ["HOME"] = tempfile.mkdtemp(prefix="fakehome_")
 os.environ["WI_FAKE_HOME"] = "1"
 
-from modules.download import _looks_binary, download_file          # noqa: E402
+from modules.download import (_looks_binary, download_file,        # noqa: E402
+                              _is_tls_fail, _curl_get_probe_ok)
 from modules.hash_utils import verify_sha1, verify_sha512          # noqa: E402
 import modules.config as cfg                                       # noqa: E402
 from modules.config import make_github_mirrors                     # noqa: E402
@@ -226,6 +227,68 @@ check("gamestate: status_lines непустой", any("smoketest" in l for l in 
 stopped = gamestate.stop_one("smoketest")
 check("gamestate: stop_one остановила", stopped is True)
 check("gamestate: реестр пуст после остановки", not gamestate.running())
+
+# ── 9. Prism-валидатор zip + curl TLS-обходы (баги из лога Windows 10) ──
+def _mk_prism_zip(path, names):
+    """Настоящий zip >10МБ (порог min_mb по умолчанию), чтобы тестировать
+    именно содержимое, а не размерную заглушку."""
+    with zipfile.ZipFile(path, "w") as z:
+        for n in names:
+            z.writestr(n, b"x" * (11 * 1024 * 1024))
+
+
+mingw_zip = tmp / "prism-mingw.zip"
+_mk_prism_zip(mingw_zip, ["prismlauncher.exe", "libicuuc78.dll"])
+msvc_zip = tmp / "prism-msvc.zip"
+_mk_prism_zip(msvc_zip, ["prismlauncher.exe", "icudt78.dll"])
+nopicu_zip = tmp / "prism-nopicu.zip"
+_mk_prism_zip(nopicu_zip, ["prismlauncher.exe", "Qt6Core.dll"])
+junk_html = tmp / "prism-junk.zip"
+junk_html.write_bytes(b"<html>proxy blocked</html>" + b" " * (20 * 1024 * 1024))
+
+# Баг №1: проверка была startswith("icu") — рабочая MinGW-w64 Portable
+# (libicuuc*.dll) отвергалась («не похож на Portable-архив, перекачай»)
+# и качалась по кругу, хотя curl отдал валидные 41.7 МБ с GitHub.
+check("MinGW-w64 Portable zip принимается (libicuuc78.dll)",
+      mc._prism_zip_ok(mingw_zip) is True)
+check("MSVC Portable zip принимается (icudt78.dll)",
+      mc._prism_zip_ok(msvc_zip) is True)
+check("zip без ICU-DLL отклоняется", mc._prism_zip_ok(nopicu_zip) is False)
+check("HTML-заглушка под видом zip отклоняется",
+      mc._prism_zip_ok(junk_html) is False)
+
+# Баг №2: _is_tls_fail ловил только текстовые фразы stderr; собственный
+# формат кода «rc=35» (пустой stderr) не распознавался — обходы
+# --tlsv1.2/--http2 никогда не добавлялись, простыня «curl не смог: rc=35».
+check("_is_tls_fail('rc=35') == True", _is_tls_fail("rc=35") is True)
+check("_is_tls_fail('...([]): rc=35') == True",
+      _is_tls_fail("curl attempt failed ([]): rc=35") is True)
+check("_is_tls_fail('SSL connect error') == True",
+      _is_tls_fail("SSL connect error") is True)
+check("_is_tls_fail('HTTP 429') == False (не TLS)", _is_tls_fail("HTTP 429") is False)
+check("_is_tls_fail('rc=6') == False (DNS, не TLS)", _is_tls_fail("rc=6") is False)
+
+# GET-проба живости зеркала (fix для HEAD rc=35): rc=63 (--max-filesize
+# сработал на большом файле) + HTTP 200 = зеркало живо; TLS-облом/4xx — нет.
+class _FakeProc:
+    def __init__(self, rc, out):
+        self.returncode, self.stdout = rc, out
+
+
+import modules.download as dl_mod                          # noqa: E402
+_orig_run = dl_mod.subprocess.run
+try:
+    dl_mod.subprocess.run = lambda *a, **k: _FakeProc(63, b"301\n200\n")
+    check("GET-проба: rc=63 + HTTP 200 = зеркало живо",
+          _curl_get_probe_ok("curl", "https://example/x") is True)
+    dl_mod.subprocess.run = lambda *a, **k: _FakeProc(35, b"")
+    check("GET-проба: TLS-облом = зеркало мертво",
+          _curl_get_probe_ok("curl", "https://example/x") is False)
+    dl_mod.subprocess.run = lambda *a, **k: _FakeProc(0, b"404")
+    check("GET-проба: HTTP 404 = зеркало мертво",
+          _curl_get_probe_ok("curl", "https://example/x") is False)
+finally:
+    dl_mod.subprocess.run = _orig_run
 
 print()
 if fails:
