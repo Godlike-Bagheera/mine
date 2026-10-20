@@ -394,7 +394,12 @@ def prism_win_urls():
                 "releases/latest",
                 headers={"User-Agent": "Mozilla/5.0",
                          "Accept": "application/vnd.github+json"})
-            with _ur.urlopen(req, timeout=8) as r:
+            # open_checked: строгий SSL-контекст + ОБХОД системного прокси.
+            # Прямой urlopen в школьной сети идёт через прокси-фильтр и
+            # ловит TLS-ошибку — тег не определяется, очередь зеркал
+            # молча деградирует до статического списка.
+            from modules.download import open_checked
+            with open_checked(req, timeout=8) as r:
                 tag = str(_json.loads(r.read()).get("tag_name") or "").strip()
         except Exception:
             tag = ""
