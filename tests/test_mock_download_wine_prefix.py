@@ -237,11 +237,6 @@ try:
     _opener_err = None
 except Exception as e:
     _opener_err = str(e).lower()
-try:
-    urllib.request.urlopen(
-        urllib.request.Request("http://http://@/"), timeout=2)
-except Exception as e:
-    pass  # сравнение не обязательно: главное — поведение opener'а
 del os.environ["HTTP_PROXY"]
 check("opener обходит системный прокси (DNS-ошибка, а не 'proxy refused')",
       _opener_err is not None and "name or service not known" in _opener_err

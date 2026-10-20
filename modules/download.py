@@ -1,6 +1,7 @@
 """Скачивание с мультизеркал, докачкой, slow-mode, aria2c, HEAD-проверкой."""
 import http.client
 import os
+import sys
 import socket
 import ssl
 import time
@@ -2243,9 +2244,6 @@ def ensure_clean_network(interactive=True):
         blocked = [d for d, r in res.items() if r["verdict"] == "dns_block"]
         if blocked:
             servers = get_system_dns_servers()
-            custom = [s for s in servers
-                      if s not in ("8.8.8.8", "8.8.4.4", "77.88.8.8",
-                                   "77.88.8.1", "1.1.1.1", "9.9.9.9")]
             stub_ips = {tuple(sorted(r["system"])) for r in res.values()
                         if r["verdict"] == "dns_block" and r["system"]}
             stub_msg = (" — все блокировки ведут на одну заглушку "
