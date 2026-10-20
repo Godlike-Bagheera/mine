@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install linters
+        run: pip install ruff
+      - name: Run ruff
+        run: ruff check .
+
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Compile all .py
+        run: python -m compileall -q modules wine.py
+
+  tests:
+    runs-on: ubuntu-latest
+    needs: [lint, syntax]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      # Тесты self-contained (stdlib-only), внешних зависимостей нет —
+      # см. requirements.txt / pyproject.toml
+      - name: Run test suite
+        run: |
+          python tests/test_fixes.py
+          python tests/test_worlds.py
+          python tests/test_shader_mod_fixes.py

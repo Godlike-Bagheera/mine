@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wine-installer"
+version = "2.6"
+description = "Портативный Wine-лаунчер для Linux: игры, Minecraft, DXVK/Vulkan, шейдеры, миры"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Godlike-Bagheera" }]
+# Ядро использует только стандартную библиотеку Python.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["ruff"]
+
+[project.scripts]
+wine-launcher = "wine:main"
+
+[tool.pytest.ini_options]
+# Тесты — standalone-скрипты (python tests/test_x.py), а не pytest-наборы.
+# Стандартный Python-сборщик отключён в tests/conftest.py (python_files
+# ниже + хук pytest_collect_file; для явного `pytest tests/test_x.py` —
+# хук pytest_pycollect_makemodule): импорт test_*.py = выполнение скрипта
+# + sys.exit -> INTERNALERROR ещё на стадии collection. Реальные
+# тесты отдаёт wrapper test_standalone_scripts из tests/conftest.py: он
+# гоняет каждый tests/test_*.py отдельным subprocess'ом и транслирует код
+# возврата в успех/провал. Никаких --ignore здесь: conftest покрывает и
+# `pytest`, и `pytest tests/`, и `pytest tests/test_x.py`.
+# python_files НЕ совпадает с test_*.py — иначе стандартный python-хук
+# pytest_collect_file возвращает Module раньше conftest-хука (каскад
+# firstresult-не-для-collect_file: непустой результат одного плагина
+# подавляет остальные), Module импортирует standalone-скрипт в процесс
+# pytest и sys.exit на верхнем уровне даёт INTERNALERROR. Реальные тесты
+# отдаёт wrapper test_standalone_scripts, ему glob не нужен.
+python_files = ["conftest.py"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = ["E402"]
+
+[tool.setuptools]
+packages = ["modules"]
+py-modules = ["wine"]
