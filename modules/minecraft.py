@@ -27,7 +27,7 @@ from modules.config import (
     SODIUM_VERSIONS_API, SODIUM_PINNED_VERSION, SODIUM_MC_VERSION,
     luxium_supports_fabric, luxium_fabric_dep,
 
-    LEGACY_JAR_URL_API,)
+    LEGACY_JAR_URL_API, LEGACY_MANUAL_PAGE, LEGACY_MANUAL_JAR_URL,)
 from modules import net
 from modules.download import download_file
 from modules.hash_utils import verify_sha512, verify_sha1, copy_to_clipboard
@@ -349,6 +349,19 @@ def _find_local_legacy_jar():
     return None
 
 
+def _open_legacy_manual_page():
+    """Открывает страницу legacylauncher.ru в браузере (для ручного скачивания)."""
+    import webbrowser
+    try:
+        if webbrowser.open(LEGACY_MANUAL_PAGE):
+            ok(f"Открыл в браузере: {LEGACY_MANUAL_PAGE}")
+            return True
+    except Exception as e:
+        debug.dbg(f"webbrowser: {e}", level="WARN")
+    hint(f"Открой вручную: {LEGACY_MANUAL_PAGE}")
+    return False
+
+
 def setup_legacy_portable():
     """Скачивает Legacy Launcher Portable .jar (если нужно) и запускает через Java.
 
@@ -371,23 +384,44 @@ def setup_legacy_portable():
         jar_path = existing
         ok(f"Portable .jar уже есть: {jar_path}")
     else:
-        # 2. Скачиваем
+        # 2. Скачиваем.
+        #    Очередь зеркал: llaun.ch / dl.llaun.ch отдают НАСТОЯЩИЙ portable
+        #    bootstrap .jar (PK-сигнатура). api.legacylauncher.net иногда не
+        #    резолвится (DNS), а dl.legacylauncher.ru/legacy/installer — это
+        #    .exe-установщик, который к тому же отвечает 403 на запросы без
+        #    браузерных заголовков («в браузере открывается» ≠ «urlopen
+        #    работает»: у urllib другой TLS-фингерпринт и UA).
         info("Скачиваю Legacy Launcher Portable...")
-        mirrors = [("api.legacylauncher.net", LEGACY_JAR_URL_API)] + list(LEGACY_JAR_MIRRORS)
-        if download_file(
+        mirrors = [("api.legacylauncher.net", LEGACY_JAR_URL_API)] + \
+            list(LEGACY_JAR_MIRRORS)
+        downloaded = download_file(
             mirrors, jar_path,
             "Legacy Launcher Portable",
             min_size_mb=1, silent=False,
-        ):
+        )
+        if downloaded:
             ok(f"Скачано: {jar_path}")
         else:
-            # 3. Фоллбэк — ручной путь
-            err("Не удалось скачать Portable .jar автоматически")
-            hint("Скачай вручную: https://dl.legacylauncher.ru/legacy/installer")
-            hint(f"И положи в: {jar_dir}  (имя: LegacyLauncher.jar)")
+            # 3. Фоллбэк — ручное скачивание из браузера.
+            err("Не удалось скачать Portable .jar автоматически.")
+            warn("Браузер открывает сайт, а скрипт — нет? Это нормально:")
+            hint("сайты Legacy Launcher блокируют запросы Python/urllib "
+                  "(другой User-Agent/TLS) или отдают .exe вместо .jar.")
+            print()
+            hint(f"Правильная страница для ручного скачивания: {LEGACY_MANUAL_PAGE}")
+            hint(f"(прямая ссылка на portable .jar: {LEGACY_MANUAL_JAR_URL})")
+            hint("Скачай файл и сохрани его в:")
+            hint(f"  {jar_path}")
+            try:
+                if copy_to_clipboard(str(jar_path)):
+                    ok("Путь для сохранения скопирован в буфер обмена")
+            except Exception as e:
+                debug.dbg(f"clipboard: {e}", level="WARN")
+            _open_legacy_manual_page()
             print()
             try:
-                manual = input(f"{YELLOW}Путь к .jar (Enter — отмена): {RESET}").strip()
+                manual = input(f"{YELLOW}Путь к скачанному файлу лаунчера"
+                               f" (Enter — отмена): {RESET}").strip().strip('"')
             except (KeyboardInterrupt, EOFError):
                 print()
                 return False
@@ -397,9 +431,17 @@ def setup_legacy_portable():
             if not jar_path.exists():
                 err(f"Файл не найден: {jar_path}")
                 return False
-            if jar_path.suffix.lower() != ".jar":
-                warn(f"Это не .jar файл: {jar_path.suffix}")
+            if jar_path.stat().st_size < LEGACY_JAR_MIN_SIZE:
+                err(f"Файл слишком маленький ({jar_path.stat().st_size} Б) — "
+                    "похоже, это не лаунчер")
                 return False
+            if jar_path.suffix.lower() == ".exe":
+                err("Это .exe-установщик — он требует Wine и известен крашем.")
+                hint("Нужен PORTABLE .jar (bootstrap.jar / LegacyLauncher.jar)")
+                hint(f"Скачать: {LEGACY_MANUAL_JAR_URL}")
+                return False
+            if jar_path.suffix.lower() != ".jar":
+                warn(f"Неожиданное расширение: {jar_path.suffix} — пробую запустить как .jar")
 
     # 4. Java
     java_bin, java_home, java_status = find_java()

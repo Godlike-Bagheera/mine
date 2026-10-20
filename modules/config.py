@@ -299,6 +299,12 @@ JDK_MIRRORS = _temurin_jdk_mirrors(_IS_WIN)
 # Legacy Launcher Portable .jar — нативный запуск на Windows 10 (без Wine).
 LEGACY_JAR_URL_API = "https://api.legacylauncher.net/ll.jar.php"
 
+# Ручное скачивание: НЕ https://dl.legacylauncher.ru/legacy/installer —
+# этот URL отдаёт .exe-установщик (не .jar) и часто отвечает 403 на
+# не-браузерные запросы. Правильная страница с portable-сборками:
+LEGACY_MANUAL_PAGE = "https://legacylauncher.ru/"
+LEGACY_MANUAL_JAR_URL = "https://llaun.ch/jar"   # редирект на dl.llaun.ch/legacy/bootstrap
+
 PRISM_URL = ("https://github.com/PrismLauncher/PrismLauncher/releases/"
              "download/11.0.3/PrismLauncher-Windows-MSVC-Portable-11.0.3.zip")
 
@@ -340,13 +346,17 @@ LEGACY_URL = LEGACY_MIRRORS[0][1]
 # Legacy Launcher Portable (.jar) — автоскачивание.
 # ─────────────────────────────────────────────────────────────
 LEGACY_JAR_MIRRORS = [
-    # Официальная прямая ссылка скачивания с сайта Legacy Launcher
-    # (отдаёт Portable .jar, поддерживает Range — можно докачивать).
-    ("dl.legacylauncher.ru (официальный installer)",
-     "https://dl.legacylauncher.ru/legacy/installer"),
-    ("go.legacylauncher.ru (официальный)", "https://go.legacylauncher.ru/jar"),
+    # llaun.ch / dl.llaun.ch — официальные зеркала, отдают именно portable
+    # bootstrap .jar (PK-сигнатура, ~11 МБ) и поддерживают Range-докачку.
+    # Проверено: https://llaun.ch/jar → 200 application/octet-stream.
     ("llaun.ch (официальный)",           "https://llaun.ch/jar"),
     ("dl.llaun.ch (прямой)",             "https://dl.llaun.ch/legacy/bootstrap"),
+    # dl.legacylauncher.ru/legacy/installer отдаёт .exe-установщик (не .jar)
+    # и часто отвечает 403 на запросы без браузерных заголовков; go.legacy...
+    # — тот же CDN. Оставлены в конце как запасные.
+    ("go.legacylauncher.ru (официальный)", "https://go.legacylauncher.ru/jar"),
+    ("dl.legacylauncher.ru (официальный installer)",
+     "https://dl.legacylauncher.ru/legacy/installer"),
     ("lln4.cc",                          "https://lln4.cc/jar"),
 ]
 LEGACY_JAR_MIN_SIZE = 1 * 1024 * 1024   # реальный .jar ~ 2-5 МБ
