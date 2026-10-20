@@ -338,12 +338,20 @@ _PRISM_WIN_BASE = ("https://github.com/PrismLauncher/PrismLauncher/releases/"
 # MSVC-Portable zip лежат icu*.dll рядом с exe.
 PRISM_WIN_ZIP_NAME = "PrismLauncher-Windows-MSVC-Portable-11.1.1.zip"
 PRISM_WIN_ZIP_URL = f"{_PRISM_WIN_BASE}/{PRISM_WIN_ZIP_NAME}"
+_PRISM_PROXY_PREFIXES = ("https://ghfast.top/", "https://ghproxy.net/",
+                         "https://gh.llkk.cc/", "https://gh-proxy.com/")
+
+# Важно: у прокси-зеркал должен быть ТОТ ЖЕ размер ответа, что и у GitHub.
+# Некоторые зеркала на неизвестный asset отдают 404-страницу (несколько КБ) —
+# раньше такое «скачивание» молча проходило проверку min_size_mb=10 только по
+# размеру zip-а; теперь download_file дополнительно сверяет точный размер и
+# магические байты PK\x03\x04 (см. _prism_zip_ok в minecraft.py).
 PRISM_WIN_URLS = [
     ("GitHub (прямой)", PRISM_WIN_ZIP_URL),
-    ("ghfast.top", f"https://ghfast.top/{PRISM_WIN_ZIP_URL}"),
-    ("ghproxy.net", f"https://ghproxy.net/{PRISM_WIN_ZIP_URL}"),
-    ("gh.llkk.cc", f"https://gh.llkk.cc/{PRISM_WIN_ZIP_URL}"),
-    ("gh-proxy.com", f"https://gh-proxy.com/{PRISM_WIN_ZIP_URL}"),
+    ("ghfast.top", _PRISM_PROXY_PREFIXES[0] + PRISM_WIN_ZIP_URL),
+    ("ghproxy.net", _PRISM_PROXY_PREFIXES[1] + PRISM_WIN_ZIP_URL),
+    ("gh.llkk.cc", _PRISM_PROXY_PREFIXES[2] + PRISM_WIN_ZIP_URL),
+    ("gh-proxy.com", _PRISM_PROXY_PREFIXES[3] + PRISM_WIN_ZIP_URL),
 ]
 
 # Запасной вариант: официальный установщик от разработчиков (Qt из их

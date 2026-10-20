@@ -29,7 +29,7 @@ from modules.config import (
 
     LEGACY_MANUAL_PAGE, LEGACY_MANUAL_JAR_URL,)
 from modules import net
-from modules.download import download_file
+from modules.download import download_file, head_check
 from modules.hash_utils import verify_sha512, verify_sha1, copy_to_clipboard
 from modules.java import find_java, install_portable_java, cmd_install_java
 from modules.prefix import choose_minecraft_dir
@@ -287,6 +287,126 @@ def _prism_has_icu(exe):
         return False
 
 
+def _prism_bad_installs():
+    """Находит старые SETUP-установки Prism (Program Files / AppData / реестр).
+
+    Именно они дают ошибку «не обнаружена icu.DLL»: Qt MinGW-сборка
+    Setup-инсталлятора не кладёт icu*.dll рядом с exe. Возвращает список
+    путей-папок, которые стоит удалить перед запуском portable-версии.
+    """
+    bad = []
+    envs = [os.environ.get("ProgramFiles"),
+            os.environ.get("ProgramFiles (x86)".replace(" ", "")),
+            os.environ.get("ProgramFiles(x86)"),
+            os.environ.get("LOCALAPPDATA")]
+    for e in envs:
+        if not e:
+            continue
+        for name in ("Prism Launcher", "PrismLauncher"):
+            p = Path(e) / name
+            if p.is_dir() and (p / "prismlauncher.exe").is_file():
+                bad.append(p)
+    # ярлык из меню «Пуск» тоже укажет на Setup-версию — ищем цель ссылки
+    try:
+        import glob
+        start = os.path.join(os.environ.get("ProgramData", ""),
+                             "Microsoft", "Windows", "Start Menu")
+        for lnk in glob.glob(os.path.join(start, "**", "*Prism*.lnk"),
+                             recursive=True):
+            try:
+                with open(lnk, "rb") as f:
+                    data = f.read()
+                # путь цели лежит в данных .lnk как utf-16le; грубо ищем
+                txt = data.decode("utf-16-le", errors="ignore")
+                for part in txt.replace("\\", "/").split("/"):
+                    pass
+                m = re.search(r"[A-Za-z]:\\\\?[^\x00]*prismlauncher\.exe",
+                              data.decode("latin-1", errors="ignore"),
+                              re.IGNORECASE)
+                if m:
+                    tgt = Path(m.group(0).replace("\\\\", "\\"))
+                    if tgt.parent.is_dir():
+                        bad.append(tgt.parent)
+            except OSError:
+                debug.dbg(f"prism lnk parse fail: {lnk}")
+    except Exception as e:
+        debug.dbg_exc(e, "_prism_bad_installs/lnk")
+    uniq, seen = [], set()
+    for b in bad:
+        key = str(b).lower().rstrip("\\/")
+        if key not in seen:
+            seen.add(key)
+            uniq.append(b)
+    return uniq
+
+
+def _uninstall_old_prism_windows(paths):
+    """Тихо удаляем старые Setup-установки Prism, чтобы Windows больше не
+    находил битый prismlauncher.exe (тот, что без icu*.dll)."""
+    import shutil
+    for p in paths:
+        try:
+            warn(f"Удаляю старую Setup-версию Prism: {p}")
+            shutil.rmtree(p)
+            ok(f"Удалено: {p}")
+        except OSError as e:
+            debug.dbg_exc(e, "_uninstall_old_prism_windows")
+            hint(f"Не удалось удалить ({e}). Удали вручную через "
+                 f"«Параметры → Приложения» или просто НЕ запускай тот "
+                 f"ярлык Prism из меню Пуск.")
+
+
+def _find_downloaded_prism_zip():
+    """Ищет скачанный браузером Portable-архив Prism в типовых папках."""
+    from modules.platform_utils import IS_WINDOWS
+    if not IS_WINDOWS:
+        return None
+    cands = []
+    home = Path.home()
+    for folder in (home / "Downloads", home):
+        if not folder.is_dir():
+            continue
+        try:
+            for f in folder.iterdir():
+                n = f.name.lower()
+                if not f.is_file():
+                    continue
+                if ("prism" in n and "windows" in n and "msvc" in n
+                        and "portable" in n
+                        and (n.endswith(".zip") or f.suffix == "")
+                        and f.stat().st_size > 10 * 1024**2):
+                    cands.append(f)
+        except OSError:
+            continue
+    if not cands:
+        return None
+    cands.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return cands[0]
+
+
+def _prism_zip_ok(path, min_mb=10):
+    # (min_mb=0 в тестах — отключить порог размера)
+    """Валидный ли это Portable-архив: сигнатура PK + внутри есть
+    prismlauncher.exe И icu*.dll. Отсекает HTML-заглушки прокси и битые
+    докачки по размеру."""
+    try:
+        if not path.is_file() or path.stat().st_size < min_mb * 1024**2:
+            return False
+        with open(path, "rb") as f:
+            if f.read(2) != b"PK":
+                return False
+        import zipfile
+        with zipfile.ZipFile(path) as z:
+            names = [n.split("/")[-1].lower() for n in z.namelist()]
+            has_exe = "prismlauncher.exe" in names
+            has_icu = any(n.startswith("icu") and n.endswith(".dll")
+                          for n in names)
+            return has_exe and has_icu
+    except Exception as e:
+        debug.dbg_exc(e, "_prism_zip_ok")
+        return False
+
+
 def setup_prism():
     from modules.platform_utils import IS_WINDOWS
     info(f"{BOLD}Установка Prism Launcher{RESET}")
@@ -295,16 +415,83 @@ def setup_prism():
         # На Windows .tar.gz с Linux-бинарником бесполезен — качаем
         # нативную portable-сборку .zip (в ней есть icu*.dll, в отличие
         # от Setup .exe / MinGW-сборок — см. PRISM_WIN_URLS) и распаковываем.
-        from modules.config import PRISM_WIN_URLS, PRISM_WIN_ZIP_NAME
+        from modules.config import (PRISM_WIN_URLS, PRISM_WIN_ZIP_NAME,
+                                    PRISM_WIN_ZIP_URL)
+
+        # Точный размер архива с GitHub: прокси-зеркала на неизвестный asset
+        # отдают заглушки; сверка по точному размеру отсекает мусор, который
+        # проходит простую проверку «>= 10 МБ». Ошибку сети не считаем отказом
+        # — тогда просто остаёмся на min_size_mb.
+        prism_exact = None
+        try:
+            _ok_h, _sz_h = head_check(PRISM_WIN_ZIP_URL)
+            if _ok_h and _sz_h and _sz_h > 5 * 1024 * 1024:
+                prism_exact = _sz_h
+        except Exception as e:
+            debug.dbg_exc(e, "setup_prism/head")
+
+        # 0) Старая SETUP-версия Prism (Program Files\Prism Launcher) —
+        # именно она выдаёт «система не обнаружила icu.DLL». Если пользователь
+        # запускает prismlauncher.exe оттуда (или по ярлыку из меню Пуск),
+        # ошибка повторяется даже после успешной portable-установки. Удаляем.
+        try:
+            bad = _prism_bad_installs()
+        except Exception as e:
+            debug.dbg_exc(e, "setup_prism/bad-installs")
+            bad = []
+        if bad:
+            _uninstall_old_prism_windows(bad)
+
+        # 1) Уже распакованная и рабочая portable-копия? (проверяем наличие
+        # icu*.dll рядом с exe — раньше этот блок молча возвращал битую
+        # старую распаковку без dll)
+        prev_exe = None
+        try:
+            prev_exe = _find_prism_exe()
+        except Exception as e:
+            debug.dbg_exc(e, "setup_prism/prev-exe")
+        if prev_exe and _prism_has_icu(prev_exe):
+            ok(f"Prism уже установлен (portable): {prev_exe}")
+            hint("Запускаю...")
+            try:
+                subprocess.Popen([str(prev_exe)],
+                                 cwd=str(Path(prev_exe).parent))
+            except Exception as e:
+                debug.dbg_exc(e, "setup_prism/win-run-prev")
+                hint(f"Или запусти вручную двойным кликом: {prev_exe}")
+            return True
+
         PRISM_DIR.mkdir(parents=True, exist_ok=True)
         dest = PRISM_DIR / PRISM_WIN_ZIP_NAME
-        archive = None if dest.is_file() and dest.stat().st_size > 10 * 1024**2 else None
+
+        # 2) Валидный архив уже скачан? Иначе — перекачиваем (старый код
+        # принимал ЛЮБОЙ файл >10 МБ, включая HTML-заглушки прокси и битые
+        # докачки, что и приводило к запуску exe без dll).
+        archive = dest if _prism_zip_ok(dest) else None
+
+        # 3) Пользователь мог скачать Portable-архив браузером (сеть блокирует
+        # Python) — ищем его в Downloads и используем.
+        if archive is None:
+            dl = _find_downloaded_prism_zip()
+            if dl and _prism_zip_ok(dl):
+                info(f"Найден скачанный браузером архив: {dl}")
+                try:
+                    shutil.copy2(dl, dest)
+                    if _prism_zip_ok(dest):
+                        archive = dest
+                except OSError as e:
+                    debug.dbg_exc(e, "setup_prism/copy-download")
+
         if archive is None and not download_file(PRISM_WIN_URLS, dest,
                                                  "Prism Launcher (Windows)",
-                                                 min_size_mb=10):
+                                                 min_size_mb=10,
+                                                 exact_size=prism_exact):
             err("Не удалось скачать Prism Launcher для Windows")
             hint("Скачай вручную через браузер: https://prismlauncher.org/downloads/")
-            hint("выбери вариант \"Portable\" (.zip), распакуй архив в:")
+            hint('выбери вариант "Portable (.zip)" (не "Installer"), например')
+            hint(f"  {PRISM_WIN_ZIP_NAME}")
+            hint("и сохрани в папку Загрузки — команда `prism` найдёт его сам,")
+            hint("либо распакуй архив целиком в:")
             hint(f"  {PRISM_DIR}")
             try:
                 copy_to_clipboard(str(PRISM_DIR))
@@ -319,6 +506,14 @@ def setup_prism():
                 debug.dbg_exc(e, "setup_prism/win-browser")
             return False
         archive = dest
+        if not _prism_zip_ok(archive):
+            err("Скачанный файл не похож на Portable-архив Prism "
+                "(нет prismlauncher.exe или icu*.dll внутри). Перекачай.")
+            try:
+                archive.unlink()
+            except OSError as e:
+                debug.dbg_exc(e, "setup_prism/unlink-bad")
+            return False
         try:
             net.safe_extract_zip(archive, PRISM_DIR)
         except Exception as e:
@@ -330,9 +525,10 @@ def setup_prism():
             err("prismlauncher.exe не найден после распаковки")
             return False
         if not _prism_has_icu(exe):
-            warn("Рядом с prismlauncher.exe нет icu*.dll — скорее всего, это "
-                 "не portable-сборка (ошибка «не обнаружена icu.dll»).")
+            err("Рядом с prismlauncher.exe нет icu*.dll — это НЕ portable-"
+                "сборка (тот самый запуск даёт «не обнаружена icu.DLL»).")
             hint("Нужен файл вида PrismLauncher-Windows-MSVC-Portable-*.zip")
+            return False
         ok(f"Prism: {exe}")
         hint("Запускаю...")
         try:

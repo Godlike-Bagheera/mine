@@ -692,18 +692,27 @@ def try_download_manual(name, url, dest, silent=False):
             r.close()
         except Exception as e:
             debug.dbg_exc(e, "download")
-def download_file(mirrors, dest, label, min_size_mb=10, silent=False):
+def download_file(mirrors, dest, label, min_size_mb=10, silent=False,
+                  exact_size=None):
     WINE_DIR.mkdir(parents=True, exist_ok=True)
     # min_size_mb=0 раньше пропускал любую закачку, включая пустые/обрубки:
     # `st_size >= 0` истинно для любого файла. Ставим нижний порог 1 КБ —
     # реальные артефакты (jar, mrpack, tar.gz) всё равно больше.
     min_size = max(min_size_mb * 1024 * 1024, 1024)
 
+    def _size_ok(p):
+        """exact_size (байт) — жёсткая проверка для больших бинарников:
+        HTML-заглушка или мусор от прокси-зеркала могут быть больше порога
+        min_size_mb; точный размер отсекает их надёжно."""
+        if exact_size:
+            return p.stat().st_size == exact_size
+        return p.stat().st_size >= min_size
+
     # Ранний выход: файл уже скачан полностью. Для бинарных архивов
     # (jar/zip/tar.gz/mrpack) проверяем «магические» байты — иначе
     # HTML-заглушка от прокси, лежащая в кэше, считалась бы успешной
     # закачкой и ломала установку на этапе распаковки.
-    if dest.exists() and dest.stat().st_size >= min_size and _looks_binary(dest):
+    if dest.exists() and _size_ok(dest) and _looks_binary(dest):
         if not silent:
             info(f"{label}: уже скачан ({dest.stat().st_size / 1024 / 1024:.1f} МБ)")
         return True
@@ -725,7 +734,7 @@ def download_file(mirrors, dest, label, min_size_mb=10, silent=False):
         else:
             start_time = time.time()
             result = download_with_aria2(url, dest, silent=silent)
-            if result is True and dest.exists() and dest.stat().st_size >= min_size \
+            if result is True and dest.exists() and _size_ok(dest) \
                     and _looks_binary(dest):
                 elapsed = time.time() - start_time
                 if elapsed > 0:
@@ -733,7 +742,7 @@ def download_file(mirrors, dest, label, min_size_mb=10, silent=False):
                 return True
     for name, url in mirrors_sorted:
         if try_download_manual(name, url, dest, silent=silent):
-            if dest.exists() and dest.stat().st_size >= min_size and _looks_binary(dest):
+            if dest.exists() and _size_ok(dest) and _looks_binary(dest):
                 return True
             if dest.exists() and not _looks_binary(dest):
                 # зеркало отдало HTML вместо бинарника — чистим и идём дальше
@@ -758,7 +767,7 @@ def download_file(mirrors, dest, label, min_size_mb=10, silent=False):
             if not silent:
                 info(f"Пробую зеркало через системный прокси: {CYAN}{name}{RESET}")
             if save_response(r, dest, name, silent=silent):
-                if dest.exists() and dest.stat().st_size >= min_size \
+                if dest.exists() and _size_ok(dest) \
                         and _looks_binary(dest):
                     return True
                 try:
@@ -769,7 +778,7 @@ def download_file(mirrors, dest, label, min_size_mb=10, silent=False):
             if not silent:
                 info(f"Пробую закачку через curl.exe: {CYAN}{name}{RESET}")
             if download_via_curl(url, dest) and dest.exists() \
-                    and dest.stat().st_size >= min_size and _looks_binary(dest):
+                    and _size_ok(dest) and _looks_binary(dest):
                 ok(f"  Готово (curl): {dest.stat().st_size / 1024 / 1024:.1f} МБ")
                 return True
     if not silent:
