@@ -345,20 +345,60 @@ def _find_local_legacy_jar():
     ]
     # Пользователь мог скачать portable-джар браузером в папку Downloads —
     # ищем там по имению, чтобы не заставлять качать то же самое повторно.
-    for pattern in ("*egacy*auncher*.jar", "bootstrap*.jar", "launcher*.jar"):
+    # Windows скачивает из Chrome/Edge без расширения (bootstrap / bootstrap (1)),
+    # поэтому паттерны — без обязательного .jar; размер и PK-сигнатуру
+    # проверяем ниже, мусор отсеется.
+    for pattern in ("*egacy*auncher*", "bootstrap*", "launcher*"):
         try:
             candidates += sorted(Path.home().glob(f"Downloads/{pattern}"),
                                  key=lambda p: p.stat().st_size, reverse=True)
         except Exception as e:
             debug.dbg(f"_find_local_legacy_jar glob {pattern}: {e}",
                       level="WARN")
+    # Legacy Launcher Portable умеет обновлять сам себя: если на диске уже
+    # есть его домашняя папка (с jar внутри) — берём лаунчер оттуда.
+    from modules.platform_utils import IS_WINDOWS as _IS_WIN
+    if _IS_WIN:
+        seen = set()
+        for base in (Path(os.environ.get("APPDATA", "")) / ".minecraft",
+                    Path(os.environ.get("APPDATA", "")) / "legacy-launcher",
+                    Path.home() / ".minecraft"):
+            try:
+                if not base.is_dir():
+                    continue
+                for cand in sorted(base.rglob("*.jar"),
+                                   key=lambda p: p.stat().st_size,
+                                   reverse=True)[:20]:
+                    nm = cand.name.lower()
+                    if ("launch" in nm or "legacy" in nm
+                            or "bootstrap" in nm) \
+                            and cand.stat().st_size > LEGACY_JAR_MIN_SIZE \
+                            and str(cand) not in seen:
+                        seen.add(str(cand))
+                        candidates.append(cand)
+            except Exception as e:
+                debug.dbg(f"_find_local_legacy_jar appdata scan: {e}",
+                          level="WARN")
     for p in candidates:
         try:
-            if p.exists() and p.is_file() and p.stat().st_size > LEGACY_JAR_MIN_SIZE:
+            if not (p.exists() and p.is_file()):
+                continue
+            if p.suffix.lower() == ".exe":
+                continue  # установщик не подходит (Wine WOW64 crash)
+            if p.stat().st_size > LEGACY_JAR_MIN_SIZE and _looks_like_jar(p):
                 return p
         except OSError:
             continue
     return None
+
+
+def _looks_like_jar(p):
+    """Первые 4 байта — PK\\x03\\x04 (zip/jar). Отсекает HTML-заглушки прокси."""
+    try:
+        with open(p, "rb") as f:
+            return f.read(4) == b"PK\x03\x04"
+    except OSError:
+        return False
 
 
 def _open_legacy_manual_page():
@@ -431,29 +471,36 @@ def setup_legacy_portable():
                 debug.dbg(f"clipboard: {e}", level="WARN")
             _open_legacy_manual_page()
             print()
-            try:
-                manual = input(f"{YELLOW}Путь к скачанному файлу лаунчера"
-                               f" (Enter — отмена): {RESET}").strip().strip('"')
-            except (KeyboardInterrupt, EOFError):
-                print()
-                return False
-            if not manual:
-                return False
-            jar_path = Path(manual).expanduser()
-            if not jar_path.exists():
-                err(f"Файл не найден: {jar_path}")
-                return False
-            if jar_path.stat().st_size < LEGACY_JAR_MIN_SIZE:
-                err(f"Файл слишком маленький ({jar_path.stat().st_size} Б) — "
-                    "похоже, это не лаунчер")
-                return False
-            if jar_path.suffix.lower() == ".exe":
-                err("Это .exe-установщик — он требует Wine и известен крашем.")
-                hint("Нужен PORTABLE .jar (bootstrap.jar / LegacyLauncher.jar)")
-                hint(f"Скачать: {LEGACY_MANUAL_JAR_URL}")
-                return False
-            if jar_path.suffix.lower() != ".jar":
-                warn(f"Неожиданное расширение: {jar_path.suffix} — пробую запустить как .jar")
+            # Возможно, браузер уже успел скачать файл (или качал раньше) —
+            # ищем сам: не придётся ничего вводить руками.
+            found = _find_local_legacy_jar()
+            if found:
+                ok(f"Нашёл скачанный лаунчер: {found}")
+                jar_path = found
+            else:
+                try:
+                    manual = input(f"{YELLOW}Путь к скачанному файлу лаунчера"
+                                   f" (Enter — отмена): {RESET}").strip().strip('"')
+                except (KeyboardInterrupt, EOFError):
+                    print()
+                    return False
+                if not manual:
+                    return False
+                jar_path = Path(manual).expanduser()
+                if not jar_path.exists():
+                    err(f"Файл не найден: {jar_path}")
+                    return False
+                if jar_path.stat().st_size < LEGACY_JAR_MIN_SIZE:
+                    err(f"Файл слишком маленький ({jar_path.stat().st_size} Б) — "
+                        "похоже, это не лаунчер")
+                    return False
+                if jar_path.suffix.lower() == ".exe":
+                    err("Это .exe-установщик — он требует Wine и известен крашем.")
+                    hint("Нужен PORTABLE .jar (bootstrap.jar / LegacyLauncher.jar)")
+                    hint(f"Скачать: {LEGACY_MANUAL_JAR_URL}")
+                    return False
+                if jar_path.suffix.lower() != ".jar":
+                    warn(f"Неожиданное расширение: {jar_path.suffix} — пробую запустить как .jar")
 
     # 4. Java
     java_bin, java_home, java_status = find_java()
@@ -554,16 +601,43 @@ def setup_legacy():
             hint("Отменено. Установи Java командой install-java, затем повтори legacy")
             return False
 
-    # 1. Уже установлен через .exe-установщик?
-    found = _find_legacy_installed()
-    if found:
-        ok(f"Legacy Launcher уже установлен: {found}")
-        return True
+    # 1. Уже установлен через .exe-установщик? (только Linux/Wine: на
+    # Windows поиск идёт по Wine-префиксу, которого там нет)
+    from modules.platform_utils import IS_WINDOWS as _IS_WIN
+    if not _IS_WIN:
+        found = _find_legacy_installed()
+        if found:
+            ok(f"Legacy Launcher уже установлен: {found}")
+            return True
 
     warn("Wine-установщик Legacy Launcher известен крашем на Wine 11 (WOW64)")
     info("Использую Portable (.jar) — работает без Wine")
     print()
-    return setup_legacy_portable()
+    good = setup_legacy_portable()
+    if not good and _IS_WIN:
+        # На Windows сеть может рвать и TLS, и Java-запросы лаунчера.
+        # Пробуем запасной путь: официальный .exe через curl.exe (Schannel),
+        # потом запускаем установщик штатными средствами Windows.
+        hint("Portable не скачался — пробую запасной вариант: "
+             ".exe-установщик через curl.exe (как браузер)")
+        exe_path = WINE_DIR / "legacy-portable" / "LegacyLauncher-setup.exe"
+        from modules.download import download_via_curl, shutil_which_curl
+        if shutil_which_curl() and download_via_curl(
+                "https://dl.legacylauncher.ru/legacy/installer", exe_path) \
+                and exe_path.stat().st_size > 2 * 1024 * 1024:
+            good(f"Скачан установщик: {exe_path}")
+            try:
+                os.startfile(str(exe_path))  # noqa: S606 — явное действие пользователя
+                hint("Запустился установщик — после установки добавь игру в"
+                     " лаунчере и повтори `legacy`")
+                return True
+            except Exception as e:
+                debug.dbg(f"startfile: {e}", level="WARN")
+                hint(f"Запусти вручную двойным кликом: {exe_path}")
+                return True
+        else:
+            err("curl.exe тоже не смог — сеть блокирует и его.")
+    return good
 
 
 # ═══════════════════════════════════════════════════════════════════

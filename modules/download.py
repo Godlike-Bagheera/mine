@@ -267,6 +267,112 @@ def _open_raw(req, timeout, _depth=0, _ctx_stage=0):
         raise reason
 
 
+def save_response(r, dest, name="mirror", silent=False):
+    """Сохраняет тело ответа (открытый объект с .read()/.headers) в файл.
+
+    Используется фоллбеками download_file (системный прокси). Возвращает
+    True, если записано >=1 КБ данных.
+    """
+    try:
+        data = r.read()
+    except Exception as e:
+        debug.dbg(f"save_response read ({name}): {e}", level="WARN")
+        return False
+    finally:
+        try:
+            r.close()
+        except Exception:
+            pass
+    if not data or len(data) < 1024:
+        return False
+    try:
+        Path(dest).write_bytes(data)
+    except OSError as e:
+        debug.dbg(f"save_response write ({name}): {e}", level="WARN")
+        return False
+    if not silent:
+        ok(f"  Готово (прокси): {len(data) / 1024 / 1024:.1f} МБ")
+    return True
+
+
+def open_system_proxy(req, timeout):
+    """Третий путь скачивания: запрос через системный прокси (IE-настройки).
+
+    В школьных/офисных сетях прямой TLS часто рвётся (WinError 10054), а
+    браузер при этом всё качает — потому что идёт через корпоративный прокси,
+    настройки которого Windows хранит в реестре. urllib.getproxies() читает
+    именно их; если прокси настроен, пробуем через него перед тем, как
+    сдаться. Возвращает ответ или None (прокси нет / не получилось) —
+    raise ничего не выбрасывает, это чистый фоллбек.
+    """
+    import urllib.request as _ur
+    try:
+        proxies = _ur.getproxies()
+    except Exception:
+        return None
+    proxy = proxies.get("https") or proxies.get("http")
+    if not proxy:
+        debug.dbg("open_system_proxy: системный прокси не настроен")
+        return None
+    if "://" not in proxy:
+        proxy = "http://" + proxy
+    debug.dbg(f"open_system_proxy: пробую через прокси {proxy}")
+    try:
+        handler = _ur.ProxyHandler({"http": proxy, "https": proxy})
+        opener = _ur.build_opener(handler)
+        resp = opener.open(_browser_headers(req), timeout=timeout)
+        ok(f"Скачиваю через системный прокси ({proxy.split('://', 1)[-1]})")
+        return resp
+    except Exception as e:
+        debug.dbg(f"open_system_proxy failed: {e}", level="WARN")
+        return None
+
+
+def download_via_curl(url, dest, timeout=CONNECT_TIMEOUT * 4):
+    """Запасная закачка системной утилитой curl (есть в Windows 10 1803+).
+
+    curl.exe использует Schannel — системное хранилище сертификатов и, если
+    он настроен, системный прокси, поэтому проходит там, где питоновский
+    ssl падает (MITM-корень школы, RST на TLS-фингерпринт Python).
+    True — файл скачан (размер проверяет вызывающий код).
+    """
+    exe = shutil_which_curl()
+    if not exe:
+        return False
+    tmp = Path(str(dest) + ".curlpart")
+    cmd = [exe, "--fail", "--location", "--tlsv1.2",
+           "--connect-timeout", str(timeout // 4 or 15),
+           "--max-time", str(timeout),
+           "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+           "--output", str(tmp), url]
+    debug.dbg(f"curl fallback: {' '.join(cmd)}")
+    try:
+        r = subprocess.run(cmd, check=False, timeout=timeout + 30,
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
+        if r.returncode == 0 and tmp.exists() and tmp.stat().st_size > 0:
+            os.replace(tmp, dest)
+            return True
+    except Exception as e:
+        debug.dbg(f"curl fallback failed: {e}", level="WARN")
+    try:
+        if tmp.exists():
+            tmp.unlink()
+    except Exception:
+        pass
+    return False
+
+
+def shutil_which_curl():
+    import shutil
+    p = shutil.which("curl") or shutil.which("curl.exe")
+    if p and Path(p).exists():
+        return p
+    # стандартное место в Windows 10 1803+
+    sys32 = Path(os.environ.get("SystemRoot", r"C:\\Windows")) / "System32" / "curl.exe"
+    return str(sys32) if sys32.exists() else None
+
+
 def _is_cert_error(e):
     """True, если ошибка — про верификацию цепочки сертификатов."""
     if isinstance(e, ssl.SSLCertVerificationError):
@@ -636,6 +742,36 @@ def download_file(mirrors, dest, label, min_size_mb=10, silent=False):
                     dest.unlink()
                 except Exception as e:
                     debug.dbg_exc(e, "download")
+    # Все зеркала упали по сети (типично для школьных фильтров: RST на весь
+    # TLS Python). Последние две попытки идут в обход питоновского ssl:
+    #  A) через системный прокси Windows (реестр/IE — браузер же качает!);
+    #  B) через штатный curl.exe (Schannel + системное хранилище сертификатов).
+    from modules.platform_utils import IS_WINDOWS as _IS_WIN
+    for name, url in mirrors_sorted[:2]:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            r = open_system_proxy(req, CONNECT_TIMEOUT)
+        except Exception as e:
+            debug.dbg(f"proxy attempt {name}: {e}", level="WARN")
+            r = None
+        if r is not None:
+            if not silent:
+                info(f"Пробую зеркало через системный прокси: {CYAN}{name}{RESET}")
+            if save_response(r, dest, name, silent=silent):
+                if dest.exists() and dest.stat().st_size >= min_size \
+                        and _looks_binary(dest):
+                    return True
+                try:
+                    dest.unlink()
+                except Exception:
+                    pass
+        if _IS_WIN:
+            if not silent:
+                info(f"Пробую закачку через curl.exe: {CYAN}{name}{RESET}")
+            if download_via_curl(url, dest) and dest.exists() \
+                    and dest.stat().st_size >= min_size and _looks_binary(dest):
+                ok(f"  Готово (curl): {dest.stat().st_size / 1024 / 1024:.1f} МБ")
+                return True
     if not silent:
         err(f"Не удалось скачать {label}.")
     return False
