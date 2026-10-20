@@ -272,16 +272,20 @@ def _find_prism_exe():
 
 
 def _prism_has_icu(exe):
-    """Проверка для Windows: рядом с prismlauncher.exe лежат icu*.dll?
+    """Проверка для Windows: рядом с prismlauncher.exe лежат ICU-DLL?
 
     Классическая ошибка «система не обнаружила icu.DLL» возникает, когда
-    запускают prismlauncher.exe из Setup-дистрибутива/MinGW-сборки или
-    копируют exe без DLL-ов. В MSVC-Portable zip файлы icu.dll / icuuc.dll
-    / icudt*.dll лежат в той же папке — если их нет, запускать бессмысленно.
+    запускают prismlauncher.exe из Setup-дистрибутива или копируют exe без
+    DLL-ов. Имена ICU зависят от сборки Qt:
+      MSVC-Portable  -> icu.dll / icuuc.dll / icudt*.dll;
+      MinGW-w64      -> libicuuc78.dll / libicuin78.dll / libicudt78.dll.
+    Поэтому ищем ЛЮБОЙ файл вида *icu*.dll — раньше проверка смотрела только
+    на startswith("icu") и рабочую MinGW-сборку считала битой (отсюда
+    бесконечные перекачивания и «icu.DLL остаётся»).
     """
     try:
         d = Path(exe).parent
-        return any(f.lower().startswith("icu") and f.lower().endswith(".dll")
+        return any("icu" in f.lower() and f.lower().endswith(".dll")
                    for f in os.listdir(d))
     except OSError:
         return False
@@ -539,7 +543,7 @@ def setup_prism():
         # На Windows .tar.gz с Linux-бинарником бесполезен — качаем
         # нативную portable-сборку .zip (в ней есть icu*.dll, в отличие
         # от Setup .exe / MinGW-сборок — см. PRISM_WIN_URLS) и распаковываем.
-        from modules.config import (PRISM_WIN_URLS, PRISM_WIN_ZIP_NAME,
+        from modules.config import (prism_win_urls, PRISM_WIN_ZIP_NAME,
                                     PRISM_WIN_ZIP_URL)
 
         # Точный размер архива с GitHub: прокси-зеркала на неизвестный asset
@@ -618,7 +622,7 @@ def setup_prism():
                 _launch_prism_exe(ex)
                 return True
 
-        if archive is None and not download_file(PRISM_WIN_URLS, dest,
+        if archive is None and not download_file(prism_win_urls(), dest,
                                                  "Prism Launcher (Windows)",
                                                  min_size_mb=10,
                                                  exact_size=prism_exact):

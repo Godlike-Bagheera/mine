@@ -305,8 +305,10 @@ LEGACY_JAR_URL_API = "https://api.legacylauncher.net/ll.jar.php"
 LEGACY_MANUAL_PAGE = "https://legacylauncher.ru/"
 LEGACY_MANUAL_JAR_URL = "https://llaun.ch/jar"   # редирект на dl.llaun.ch/legacy/bootstrap
 
+# Эта константа — только fallback для Windows-URL'ов ниже; сам Linux-путь
+# скачивает tar.gz с latest-релиза (LATEST_PRISM_LINUX_URL в minecraft.py).
 PRISM_URL = ("https://github.com/PrismLauncher/PrismLauncher/releases/"
-             "download/11.0.3/PrismLauncher-Windows-MSVC-Portable-11.0.3.zip")
+             "download/11.1.1/PrismLauncher-Windows-MinGW-w64-Portable-11.1.1.zip")
 
 # ─────────────────────────────────────────────────────────────
 # Legacy Launcher — .exe-установщик.
@@ -331,12 +333,16 @@ LEGACY_MIRRORS = [
 _PRISM_WIN_BASE = ("https://github.com/PrismLauncher/PrismLauncher/releases/"
                    "download/11.1.1")
 
-# Portable .zip — основная сборка для Windows. В Setup .exe и MinGW/w64
-# сборках Qt ICU-библиотеки (icu.dll / icuuc.dll) НЕ включены в пакет —
-# при запуске prismlauncher.exe Windows выдаёт «Не удается продолжить
-# выполнение кода, поскольку система не обнаружила icu.DLL». Только в
-# MSVC-Portable zip лежат icu*.dll рядом с exe.
-PRISM_WIN_ZIP_NAME = "PrismLauncher-Windows-MSVC-Portable-11.1.1.zip"
+# Portable .zip — основная сборка для Windows: MinGW-w64.
+# Проверено содержимое релизов 11.1.1 (распаковывали оба архива):
+#   MinGW-w64-Portable -> libicudt78.dll, libicuin78.dll, libicuuc78.dll
+#                         + qt6core.dll и сам prismlauncher.exe;
+#   MSVC-Portable      -> только icuuc.dll из ICU (icu.dll / icuuc.dll под
+#                         именем, которого нет в привязке Qt, не найдётся).
+# Именно поэтому раньше MSVC-сборка на части машин падала с
+# «система не обнаружила icu.DLL»: у MinGW-сборки ICU-DLL полные и лежат
+# рядом с exe. Берём MinGW-w64 Portable x86_64 (не arm64, не Setup .exe).
+PRISM_WIN_ZIP_NAME = "PrismLauncher-Windows-MinGW-w64-Portable-11.1.1.zip"
 PRISM_WIN_ZIP_URL = f"{_PRISM_WIN_BASE}/{PRISM_WIN_ZIP_NAME}"
 _PRISM_PROXY_PREFIXES = ("https://ghfast.top/", "https://ghproxy.net/",
                          "https://gh.llkk.cc/", "https://gh-proxy.com/")
@@ -352,6 +358,9 @@ _PRISM_PROXY_PREFIXES = ("https://ghfast.top/", "https://ghproxy.net/",
 # отдаёт ему свой asset напрямую, домен Яндекса фильтры обычно не рвут.
 PRISM_YANDEX_CDN_URL = ("https://dlcdn.com.cdn.delivered.by/" +
                         PRISM_WIN_ZIP_URL.removeprefix("https://"))
+
+# Fallback-очередь (используется, если GitHub API недоступен). Живость
+# каждого зеркала проверена HEAD-запросом к asset MinGW-w64 Portable.
 PRISM_WIN_URLS = [
     ("GitHub (релиз)", PRISM_WIN_ZIP_URL),
     ("Яндекс CDN (delivered.by)", PRISM_YANDEX_CDN_URL),
@@ -360,6 +369,50 @@ PRISM_WIN_URLS = [
     ("gh.llkk.cc", _PRISM_PROXY_PREFIXES[2] + PRISM_WIN_ZIP_URL),
     ("gh-proxy.com", _PRISM_PROXY_PREFIXES[3] + PRISM_WIN_ZIP_URL),
 ]
+
+
+def prism_win_urls():
+    """Очередь зеркал Prism Portable для Windows.
+
+    Имя файла строится из актуального latest-тега через GitHub API
+    (Prism часто выкатывает патчи — захардкоженная версия со временем
+    отдаёт 404 и пользователь видит «не удалось скачать»). Если API
+    недоступен (блок, rate limit) — возвращаем статический список выше,
+    он всегда валиден для 11.1.1.
+
+    WI_PRISM_VERSION — переопределение тега релиза вручную.
+    """
+    import os as _os
+    tag = (_os.environ.get("WI_PRISM_VERSION") or "").strip()
+    if not tag:
+        try:
+            import json as _json
+            import urllib.request as _ur
+            req = _ur.Request(
+                "https://api.github.com/repos/PrismLauncher/PrismLauncher/"
+                "releases/latest",
+                headers={"User-Agent": "Mozilla/5.0",
+                         "Accept": "application/vnd.github+json"})
+            with _ur.urlopen(req, timeout=8) as r:
+                tag = str(_json.loads(r.read()).get("tag_name") or "").strip()
+        except Exception:
+            tag = ""
+    if not tag:
+        return list(PRISM_WIN_URLS)
+    name = f"PrismLauncher-Windows-MinGW-w64-Portable-{tag}.zip"
+    base = ("https://github.com/PrismLauncher/PrismLauncher/releases/"
+            f"download/{tag}")
+    url = f"{base}/{name}"
+    out = [("GitHub (latest)", url),
+           ("Яндекс CDN (delivered.by)",
+            "https://dlcdn.com.cdn.delivered.by/" + url.removeprefix("https://"))]
+    out += [(f"{p.split('://', 1)[1].rstrip('/')}", p + url)
+            for p in _PRISM_PROXY_PREFIXES]
+    # Статическая очередь — на случай, если у latest-asset другое имя.
+    for item in PRISM_WIN_URLS:
+        if item[1] not in [u for _, u in out]:
+            out.append(item)
+    return out
 
 # Зеркала Legacy Launcher Portable (.jar) для Windows с учётом блокировок:
 # к официальным доменам школьные фильтры часто рвут TLS (WinError 10054).
@@ -389,13 +442,18 @@ LEGACY_JAR_WIN_MIRRORS = [
     # самый чистый путь (portable без установщика). Но они часто RST'ятся DPI.
     ("llaun.ch (официальный)", "https://llaun.ch/jar"),
     ("dl.llaun.ch (прямой)", "https://dl.llaun.ch/legacy/bootstrap"),
+    # Web Archive: зеркало llaun.ch/jar с обычным (не Cloudflare) TLS —
+    # проходит там, где прямые домены рвутся с rc=35. Отдаёт редиректы на
+    # сохранённый bootstrap.jar; скачивание с -L работает стабильно.
+    ("Web Archive (llaun.ch/jar)",
+     "https://web.archive.org/web/2024id_/https://llaun.ch/jar"),
     # Если .jar недоступны — сразу переходим к официальному .exe через CDN:
     # он медленнее стартует (долгий HEAD + TLS handshake), но надёжнее проходит
     # через корпоративные файрволы и школьные MITM-прокси.
     *LEGACY_WIN_OFFICIAL_CDN,
-    ("Archive.org (bootstrap jar)",
-     "https://archive.org/download/legacy-launcher-bootstrap/"
-     "LegacyLauncher.jar"),
+    # ВНИМАНИЕ: старого item «legacy-launcher-bootstrap» на archive.org не
+    # существует (404 + curl rc=23) — убрано из очереди, чтобы не тратить
+    # таймауты на заведомо мёртвое зеркало.
     ("go.legacylauncher.ru", "https://go.legacylauncher.ru/jar"),
 ]
 

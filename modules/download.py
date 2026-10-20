@@ -395,6 +395,39 @@ def warn_if_windows_proxy():
     hint("'Использовать прокси-сервер' = ОТКЛ (или netsh winhttp reset proxy)")
 
 
+# Типовые текстовые ответы вместо файла (HTML-заглушки фильтров/прокси).
+_HTML_FAIL_MARKERS = (b"<!doctype", b"<html", b"<head", b"<?xml")
+
+
+def _downloaded_text_stub(path):
+    """True, если файл похож на HTML/XML-заглушку (а не на бинарник)."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(64)
+        low = head.lower().lstrip(b"\xef\xbb\xbf \t\r\n")
+        return any(low.startswith(m) for m in _HTML_FAIL_MARKERS)
+    except OSError:
+        return False
+
+
+def _is_tls_fail(errtxt):
+    """curl rc=35 (SSL connect error) / TLS-фразы в stderr — рукопожатие
+    не прошло (свежий Schannel + TLS 1.3 не дружат с Cloudflare и рядом
+    CDN; лечится --tlsv1.2). rc=6 — DNS не резолвится, это НЕ TLS-ошибка."""
+    t = (errtxt or "").lower()
+    if "error 35" in t or "ssl connect error" in t \
+            or "schannel" in t or "tls" in t:
+        return True
+    return False
+
+
+# URL -> аргументы curl, с которыми HEAD-проба зеркала прошла, хотя без
+# них падала (rc=35). Заполняется в probe_mirrors_with_curl, используется в
+# download_queue_with_curl, чтобы не жечь таймауты на заведомо битом
+# TLS-рукопожатии. Живёт весь запуск скрипта.
+_tls_fix_cache = {}
+
+
 def _curl_base_args(timeout, extra=None):
     """Общие аргументы curl. При включённом прокси Windows добавляем
     --noproxy '*' — качаем напрямую, как того хочет пользователь.
@@ -466,15 +499,15 @@ def _fmt_speed(bps):
         return f"{bps / 1024 / 1024:.1f} МБ/с"
 
 
-def _curl_head_size(exe, url, timeout=15):
+def _curl_head_size(exe, url, timeout=15, extra=None):
     """Быстрый HEAD-запрос для получения размера файла. Возвращает байты или None."""
     try:
         cmd = [exe, "-I", "--silent", "--show-error",
                "--connect-timeout", str(timeout // 3),
                "--max-time", str(timeout),
                "--location-trusted",
-               "--user-agent", CURL_BROWSER_UA,
-               url]
+               "--user-agent", CURL_BROWSER_UA] \
+            + list(extra or []) + [url]
         r = subprocess.run(cmd, check=False, timeout=timeout + 5,
                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         for line in (r.stdout or b"").decode("utf-8", errors="ignore").splitlines():
@@ -645,15 +678,19 @@ def _curl_with_progressbar(exe, url, tmp, timeout, extra=None, expected_size=Non
         return False, str(e)
 
 
-def _run_curl(exe, url, tmp, timeout, extra=None):
+def _run_curl(exe, url, tmp, timeout, extra=None, head_extra=None):
     """Один запуск curl.exe -> tmp. Возвращает (True|False, текст_ошибки).
 
     Автоматически выбирает режим: обычный для быстрых скачиваний,
     с прогресс-баром для больших файлов (>3 МБ ожидаемо).
+    head_extra — доп. аргументы только для HEAD-пробы размера (TLS-фиксы
+    --tlsv1.2/--http2 из очереди attempts; без них проба падает с rc=35
+    и тянет таймаут на недоступном рукопожатии).
     """
     # Пробуем узнать размер через HEAD (быстро, до 10 сек)
     head_timeout = min(10, timeout // 6)
-    expected_size = _curl_head_size(exe, url, timeout=head_timeout)
+    expected_size = _curl_head_size(exe, url, timeout=head_timeout,
+                                    extra=head_extra)
 
     debug.dbg(f"_run_curl: expected_size={expected_size}")
 
@@ -690,8 +727,11 @@ def _run_curl(exe, url, tmp, timeout, extra=None):
         return False, str(e)
 
 
-def download_via_curl(url, dest, timeout=CONNECT_TIMEOUT * 4):
+def download_via_curl(url, dest, timeout=CONNECT_TIMEOUT * 4, extra=None):
     """Запасная закачка системной утилитой curl (есть в Windows 10 1803+).
+
+    extra — доп. аргументы curl для всех заходов (например ["--tlsv1.2"],
+    который HEAD-проба зеркала подобрала через _tls_fix_cache).
 
     curl.exe использует Schannel — системное хранилище сертификатов и, если
     он настроен, системный прокси, поэтому проходит там, где питоновский
@@ -701,8 +741,18 @@ def download_via_curl(url, dest, timeout=CONNECT_TIMEOUT * 4):
     Варианты запуска (первый же успех прерывает цикл):
       1) как есть — curl сам подхватит системный прокси из реестра;
       2) --noproxy "*" — если корпоративный прокси мешает прямой закачке;
-      3) insecure — только при WI_INSECURE_SSL=1 (школа с MITM-сертификатом);
-      4) wget.exe — если вдруг curl отсутствует, но есть wget в PATH.
+      3) --tlsv1.2 / --http2 — см. ниже (лечит rc=35);
+      4) insecure — только при WI_INSECURE_SSL=1 (школа с MITM-сертификатом);
+      5) wget.exe — если вдруг curl отсутствует, но есть wget в PATH.
+
+    ЛЕЧИМ rc=35 («SSL connect error», curl: (35)): на Windows 10 22H2+ и 11
+    встроенный curl работает через Schannel, и его TLS 1.3 ClientHello не
+    проходят с Cloudflare (llaun.ch / dl.llaun.ch), а иногда и с другими CDN
+    — рукопожатие рвётся ещё до сертификата. Браузер в это время качает,
+    потому что использует другие наборы параметров. Проверенные обходы:
+      * --tlsv1.2 — принудительно старый добрый TLS 1.2;
+      * --http2   — другой ClientHello (HTTP/2 ALPN), тоже часто проходит.
+    Поэтому при ошибке TLS добавляем эти заходы в конец очереди вариантов.
     """
     exe = shutil_which_curl()
     if not exe:
@@ -729,16 +779,23 @@ def download_via_curl(url, dest, timeout=CONNECT_TIMEOUT * 4):
         debug.dbg(f"curl resume skip: {e}", level="WARN")
     # Если в Windows включён прокси — обходим его напрямую (_curl_base_args
     # добавит --noproxy '*'); отдельный --noproxy-заход тогда не нужен.
-    attempts = [[]]
+    attempts = [list(extra or [])]
     if not windows_ie_proxy()["enabled"]:
-        attempts.append(["--noproxy", "*"])
+        attempts.append(list(extra or []) + ["--noproxy", "*"])
     if _insecure_fallback_allowed():
         attempts.append(["--insecure"])
         warn("curl: нестрогая проверка сертификатов "
              "(WI_INSECURE_SSL=1 включён пользователем)")
     last_err = ""
-    for extra in attempts:
-        ok_, errtxt = _run_curl(exe, url, tmp, timeout, extra)
+    tls_note_shown = False
+    for extra in list(attempts):
+        # Если базовый заход упал с rc=35, последующие TLS-фиксы
+        # (--tlsv1.2 / --http2) должны унаследовать их в HEAD-пробе тоже,
+        # иначе _run_curl зависнет на недоступном рукопожатии ещё до GET.
+        head_extra = [a for a in extra if a != "--noproxy" and a != "*"] \
+            if any(a in ("--tlsv1.2", "--http2") for a in extra) else None
+        ok_, errtxt = _run_curl(exe, url, tmp, timeout, extra,
+                                head_extra=head_extra)
         if ok_ and _curl_http_ok(errtxt):
             # Проверка содержимого до переноса: gh-proxy/HTML-заглушка или
             # склеенный при обрыве zip раньше проходили по размеру и
@@ -761,6 +818,19 @@ def download_via_curl(url, dest, timeout=CONNECT_TIMEOUT * 4):
             errtxt = f"HTTP {errtxt}"
         last_err = errtxt
         debug.dbg(f"curl attempt failed ({extra}): {errtxt}", level="WARN")
+        # rc=35 (SSL connect error): пробуем те же запросы, но с другим
+        # вариантом TLS — Schannel + TLS 1.3 падает на Cloudflare-доменах
+        # (llaun.ch / dl.llaun.ch), а с --tlsv1.2 или --http2 проходит.
+        if _is_tls_fail(errtxt):
+            if not tls_note_shown:
+                tls_note_shown = True
+                info("  curl: TLS-рукопожатие не прошло (rc=35) — "
+                     "пробую обходные варианты (--tlsv1.2 / --http2)")
+            for tlsfix in (["--tlsv1.2"], ["--http2"]):
+                combo = list(extra) + tlsfix
+                if combo in attempts:
+                    continue
+                attempts.append(combo)
     if last_err:
         info(f"  curl не смог: {last_err[:120]}")
     try:
@@ -803,12 +873,13 @@ def _curl_noproxy_args():
     return ["--noproxy", "*"] if windows_ie_proxy()["enabled"] else []
 
 
-def _curl_head_ok(exe, url, timeout=20):
+def _curl_head_ok(exe, url, timeout=20, extra=None):
     """Быстрая HEAD-проверка живости зеркала через curl (-I). True/False."""
     cmd = [exe, "-I", "-s", "-o", os.devnull, "--http1.1",
            "--connect-timeout", str(max(timeout // 3, 8)),
            "--max-time", str(timeout),
-           "--user-agent", CURL_BROWSER_UA] + _curl_noproxy_args() + [url]
+           "--user-agent", CURL_BROWSER_UA] \
+        + _curl_noproxy_args() + list(extra or []) + [url]
     try:
         r = subprocess.run(cmd, check=False, timeout=timeout + 15,
                            stdout=subprocess.DEVNULL,
@@ -824,7 +895,7 @@ def _curl_head_ok(exe, url, timeout=20):
                 "--max-time", str(timeout),
                 "--user-agent", CURL_BROWSER_UA,
                 "--write-out", "%{http_code}", "--output", os.devnull] \
-            + _curl_noproxy_args() + [url]
+            + _curl_noproxy_args() + list(extra or []) + [url]
         r2 = subprocess.run(cmd2, check=False, timeout=timeout + 15,
                             stdout=subprocess.PIPE,
                             stderr=subprocess.DEVNULL)
@@ -845,6 +916,11 @@ def probe_mirrors_with_curl(mirrors, budget_sec=25):
     HEAD-запросом (общий бюджет ~budget_sec секунд); живые ставятся в начало
     в исходном порядке, мёртвые — в конец. Ошибки проверки НЕ удаляют
     зеркало (пробовали же HEAD, а GET работает иначе) — просто отодвигают.
+
+    Битый по TLS зеркало (rc=35 у Schannel) перепроверяется с --tlsv1.2:
+    если так проходит — зеркало живое, просто требует TLS 1.2; ставим его
+    в начало и запоминаем флаг, чтобы download_queue_with_curl передал
+    фикс в саму закачку (_tls_fix_cache).
     """
     from modules.platform_utils import IS_WINDOWS as _IS_WIN
     if not _IS_WIN or len(mirrors) <= 1:
@@ -862,6 +938,11 @@ def probe_mirrors_with_curl(mirrors, budget_sec=25):
         per = max(int(deadline - time.time()), 5)
         if _curl_head_ok(exe, url, timeout=min(15, per)):
             alive.append(item)
+        elif _curl_head_ok(exe, url, timeout=min(15, per),
+                           extra=["--tlsv1.2"]):
+            debug.dbg(f"probe: {name} жив только с TLS 1.2")
+            _tls_fix_cache[url] = ["--tlsv1.2"]
+            alive.insert(0, item)
         else:
             debug.dbg(f"probe: {name} недоступен/медлит — отодвигаю")
             dead.append(item)
@@ -908,7 +989,8 @@ def download_queue_with_curl(mirrors, dest, min_bytes=1024, silent=False):
         if not silent:
             info(f"Пробую закачку через curl.exe: {CYAN}{name}{RESET}")
         timeout = CONNECT_TIMEOUT * 4
-        if download_via_curl(url, dest, timeout=timeout):
+        if download_via_curl(url, dest, timeout=timeout,
+                              extra=_tls_fix_cache.get(url)):
             try:
                 if dest.stat().st_size >= max(min_bytes, 1024):
                     ok(f"  Готово (curl): "
@@ -1355,7 +1437,7 @@ def download_file(mirrors, dest, label, min_size_mb=10, silent=False,
         if _IS_WIN:
             if not silent:
                 info(f"Пробую закачку через curl.exe: {CYAN}{name}{RESET}")
-            if download_via_curl(url, dest) and dest.exists() \
+            if download_via_curl(url, dest, extra=_tls_fix_cache.get(url)) and dest.exists() \
                     and _size_ok(dest) and _looks_binary(dest):
                 ok(f"  Готово (curl): {dest.stat().st_size / 1024 / 1024:.1f} МБ")
                 return True
@@ -1371,7 +1453,7 @@ def download_file(mirrors, dest, label, min_size_mb=10, silent=False,
                 return True
             if not silent:
                 info(f"Пробую закачку через curl.exe: {CYAN}{name}{RESET}")
-            if download_via_curl(url, dest) and dest.exists() \
+            if download_via_curl(url, dest, extra=_tls_fix_cache.get(url)) and dest.exists() \
                     and _size_ok(dest) and _looks_binary(dest):
                 ok(f"  Готово (curl): {dest.stat().st_size / 1024 / 1024:.1f} МБ")
                 return True
