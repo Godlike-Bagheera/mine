@@ -564,6 +564,26 @@ def _curl_http_ok(errtxt):
 
 _CURL_OK_CODES = {"200", "206", "301", "302", "303", "307", "308"}
 
+#: HTTP-коды, которые означают «зеркало живое, но URL больше не годится»:
+#: 403 — подпись отрезана/истекла до выдачи, 410 Gone — ссылка с ?md5=&expires=
+#: протухла (Yandex CDN Legacy отдаёт именно так). Повторять такие заходы
+#: бесполезно и это НЕ блокировка сети — см. signed_url_expired().
+_SIGNED_URL_DEAD_CODES = {403, 410}
+
+
+def signed_url_expired(errtext):
+    """True, если curl получил 403/410 на подписанном URL (?md5=&expires=).
+
+    Лечит тихий провал: зеркало Yandex CDN отвечает 410 по истечении
+    expires, очередь молча идёт дальше, а пользователь видит «curl не смог»
+    без объяснения. Так отличаем протухшую ссылку от DPI-блокировки — при
+    403/410 печатаем подсказку обновить URL из LEGACY_WIN_OFFICIAL_CDN.
+    """
+    s = str(errtext or "")
+    if "HTTP 403" in s or "HTTP 410" in s:
+        return True
+    return False
+
 
 def _downloaded_file_plausible(dest_tmp, url=""):
     """Здравый смысл скачанного файла до переноса на место назначения.
@@ -735,8 +755,14 @@ def _run_curl(exe, url, tmp, timeout, extra=None, head_extra=None):
         return False, str(e)
 
 
-def download_via_curl(url, dest, timeout=CONNECT_TIMEOUT * 4, extra=None):
+def download_via_curl(url, dest, timeout=CONNECT_TIMEOUT * 4, extra=None,
+                      return_error=False):
     """Запасная закачка системной утилитой curl (есть в Windows 10 1803+).
+
+    return_error=True — вместо bool вернуть текст последней ошибки
+    ('' при успехе, 'HTTP 403', 'rc=35', ...) для честной диагностики:
+    signed_url_expired() отличает протухшую одноразовую подпись Yandex CDN
+    (?md5=&expires=) от блокировки сети.
 
     extra — доп. аргументы curl для всех заходов (например ["--tlsv1.2"],
     который HEAD-проба зеркала подобрала через _tls_fix_cache).
@@ -764,7 +790,8 @@ def download_via_curl(url, dest, timeout=CONNECT_TIMEOUT * 4, extra=None):
     """
     exe = shutil_which_curl()
     if not exe:
-        return _download_via_wget(url, dest, timeout)
+        w = _download_via_wget(url, dest, timeout)
+        return ("" if w else "curl.exe не найден") if return_error else w
     # Если HEAD-проба (probe_mirrors_with_curl) уже выяснила, что зеркало
     # живо только с TLS-фиксом, а вызывающий код не передал extra —
     # подхватим фикс из кэша сами. Иначе первый заход снова падает с
@@ -784,7 +811,7 @@ def download_via_curl(url, dest, timeout=CONNECT_TIMEOUT * 4, extra=None):
                     and _downloaded_file_plausible(tmp):
                 os.replace(tmp, dest)
                 debug.dbg("curl: докачали оборванный файл (-C -)")
-                return True
+                return "" if return_error else True
             #Range не поддержан или мусор — начинаем заново с чистого tmp
             try:
                 tmp.unlink()
@@ -826,7 +853,7 @@ def download_via_curl(url, dest, timeout=CONNECT_TIMEOUT * 4, extra=None):
                     pass
                 continue
             os.replace(tmp, dest)
-            return True
+            return "" if return_error else True
         if ok_:
             # rc=0, но в выводе есть HTTP-код ошибки (без --fail curl так
             # молча сохраняет 404/503-страницы как «успех»)
@@ -853,7 +880,7 @@ def download_via_curl(url, dest, timeout=CONNECT_TIMEOUT * 4, extra=None):
             tmp.unlink()
     except Exception:
         pass
-    return False
+    return last_err if return_error else False
 
 
 def _download_via_wget(url, dest, timeout):
@@ -1217,8 +1244,10 @@ def download_queue_with_curl(mirrors, dest, min_bytes=1024, silent=False,
         if not silent:
             info(f"Пробую закачку через curl.exe: {CYAN}{name}{RESET}")
         timeout = CONNECT_TIMEOUT * 4
-        if download_via_curl(url, dest, timeout=timeout,
-                              extra=_tls_fix_cache.get(url)):
+        curl_err = download_via_curl(url, dest, timeout=timeout,
+                                     extra=_tls_fix_cache.get(url),
+                                     return_error=True)
+        if not curl_err:
             try:
                 if dest.stat().st_size >= max(min_bytes, 1024):
                     if validator is not None and not validator(dest):
@@ -1239,6 +1268,11 @@ def download_queue_with_curl(mirrors, dest, min_bytes=1024, silent=False,
                 warn("  curl скачал слишком мало — пробую следующее зеркало")
             except OSError:
                 pass
+        elif signed_url_expired(curl_err):
+            # Yandex CDN одноразово-подписные ссылки (?md5=&expires=):
+            # 403/410 = подпись отрезана/истекла, это НЕ блокировка сети.
+            warn(f"  {name}: {curl_err[:60]} — одноразовая подпись ссылки "
+                 f"(?md5=&expires=) истекла. Обнови URL на https://llaun.ch/exe")
     return None
 
 

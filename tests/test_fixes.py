@@ -420,16 +420,16 @@ try:
     dl_mod2.shutil_which_curl = lambda: "/usr/bin/curl"
     dl_mod2.probe_mirrors_with_curl = lambda m, budget_sec=25: list(m)
 
-    def _fake_dlvcurl(url, dest, timeout=60, extra=None):
+    def _fake_dlvcurl(url, dest, timeout=60, extra=None, return_error=False):
         # curl «успешно» скачал: MZ-установщик лежит в .jar-файле
         p = Path(str(dest) + ".part") if str(dest).endswith(".part") \
             else None
         tgt = p if (p and p.exists()) else Path(dest)
         try:
             tgt.write_bytes(exe_jar.read_bytes())
-            return True
+            return "" if return_error else True
         except OSError:
-            return False
+            return "disk error" if return_error else False
 
     dl_mod2.download_via_curl = _fake_dlvcurl
     got = dl_mod2.download_queue_with_curl(

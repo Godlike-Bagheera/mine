@@ -420,10 +420,23 @@ def prism_win_urls():
 # curl.exe по всей очереди): archive.org — обычный статичный HTTPS без
 # редиректов иTLS-фиngerprint-блокировок, поэтому первым; официальные
 # домены — следом.
-# Официальный Yandex-CDN Legacy Launcher отдаёт НАСТОЯЩИЙ установщик .exe,
-# проверено работает даже когда все зеркала .jar блокируются сетью.
-# Он медленный (думает 20-30 сек), но стабильный и качает до конца.
+# Официальный Yandex-CDN Legacy Launcher: домен dl-cdn-yc.legacylauncher.ru
+# проходит там, где все llaun.ch / legacylauncher.ru домены рвутся DPI
+# (rc=35 / WinError 10054). На нём лежат ОБА артефакта:
+#   * /legacy/bootstrap/LegacyLauncher.jar — НАСТОЯЩИЙ portable .jar (PK-,
+#     ~11 МБ) — самый быстрый чистый путь на Windows;
+#   * /legacy/installer/LegacyLauncher.exe — установщик (.exe, MZ-).
+# Ссылки одноразово-подписные (?md5=&expires=): без подписи CDN отвечает
+# 403, просроченная подпись — 410. Подпись .exe из этой очереди уже
+# истекла (проверено HEAD'ом: 410 Gone) — если curl вернёт 403/410,
+# обнови URL со страницы https://llaun.ch/exe (или бери свежий .jar ниже).
+LEGACY_YANDEX_CDN_JAR = (
+    "https://dl-cdn-yc.legacylauncher.ru/legacy/bootstrap/"
+    "LegacyLauncher.jar?md5=2GkVngrgPKDBjiKk9BP0kg&expires=1792494154")
 LEGACY_WIN_OFFICIAL_CDN = [
+    # Первым — portable .jar с того же CDN: он в 10 раз легче установщика
+    # и не требует ручных действий (установщик нужно ещё запустить).
+    ("Yandex CDN (официальный .jar)", LEGACY_YANDEX_CDN_JAR),
     ("Yandex CDN (официальный .exe)",
      "https://dl-cdn-yc.legacylauncher.ru/legacy/installer/LegacyLauncher.exe"
      "?md5=amzePVm455iPVFWWsKbn8A&expires=1792485882"),
@@ -447,9 +460,10 @@ LEGACY_JAR_WIN_MIRRORS = [
     # сохранённый bootstrap.jar; скачивание с -L работает стабильно.
     ("Web Archive (llaun.ch/jar)",
      "https://web.archive.org/web/2024id_/https://llaun.ch/jar"),
-    # Если .jar недоступны — сразу переходим к официальному .exe через CDN:
-    # он медленнее стартует (долгий HEAD + TLS handshake), но надёжнее проходит
-    # через корпоративные файрволы и школьные MITM-прокси.
+    # Если быстрые .jar недоступны — идём на официальный Yandex-CDN: там
+    # лежат и portable .jar (/legacy/bootstrap/LegacyLauncher.jar), и
+    # установщик .exe (/legacy/installer/...). Домен Яндекса школьные
+    # фильтры обычно не рвут, поэтому зеркало реально рабочее.
     *LEGACY_WIN_OFFICIAL_CDN,
     # ВНИМАНИЕ: старого item «legacy-launcher-bootstrap» на archive.org не
     # существует (404 + curl rc=23) — убрано из очереди, чтобы не тратить
