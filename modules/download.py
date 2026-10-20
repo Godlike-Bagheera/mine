@@ -507,6 +507,38 @@ def _fmt_speed(bps):
         return f"{bps / 1024 / 1024:.1f} МБ/с"
 
 
+# URL -> список TLS-аргументов, которые уже НЕ помогают на этом зеркале
+# (например --tlsv1.2 тоже упал с rc=35). Заполняется при провале GET'а с
+# фиксом в download_via_curl и при HEAD/GET-пробах в
+# probe_mirrors_with_curl: без кэша каждое повторное касание зеркала
+# (HEAD-проба -> GET -> следующая очередь) снова жгло ~40 секунд на
+# заведомо мёртвых рукопожатиях. В DPI-сети, рвущей ВСЕ домены лаунчера,
+# именно эти повторы превращали ограниченный бюджет попыток в
+# многочасовое «качается». Живёт весь запуск скрипта.
+_tls_dead_cache = {}
+
+
+def _tls_variants(url, base_extra):
+    """TLS-обходы, которые ещё НЕ испробованы/не провалились для url.
+
+    base_extra — фикс из _tls_fix_cache или явные аргументы вызывающей
+    стороны; уже доказанно мёртвые варианты (_tls_dead_cache) не
+    возвращаются.
+    """
+    dead = set(tuple(v) for v in _tls_dead_cache.get(url, []))
+    out = []
+    for v in ([["--tlsv1.2"], ["--http2"]]):
+        combo = list(base_extra or []) + v
+        if tuple(combo) not in dead:
+            out.append(combo)
+    return out
+
+
+def _mark_tls_dead(url, variant):
+    """Запоминаем, что вариант TLS на этом URL не помог (rc=35 и там)."""
+    _tls_dead_cache.setdefault(url, []).append(list(variant))
+
+
 def _curl_head_size(exe, url, timeout=15, extra=None):
     """Быстрый HEAD-запрос для получения размера файла. Возвращает байты или None."""
     try:
@@ -799,6 +831,16 @@ def download_via_curl(url, dest, timeout=CONNECT_TIMEOUT * 4, extra=None,
     # «curl не смог: rc=35» по всем зеркалам Legacy.
     if not extra:
         extra = _tls_fix_cache.get(url)
+    # Зеркало уже доказанно мертво по TLS (обе ветки --tlsv1.2/--http2
+    # падали с rc=35 — см. _tls_dead_cache): не жжём таймауты повторно,
+    # отказ мгновенный. Это лечит «второй заход legacy качается ещё
+    # полчаса»: в DPI-сети RST прилетает всем доменам одинаково, и
+    # повторные полные цепочки ретраев бессмысленны.
+    dead_set = {tuple(v) for v in _tls_dead_cache.get(url, [])}
+    if {("--tlsv1.2",), ("--http2",)} <= dead_set:
+        debug.dbg(f"curl: {url[:60]} известен как TLS-мёртвый — пропуск",
+                  level="WARN")
+        return "rc=35 (уже проверено)" if return_error else False
     tmp = Path(str(dest) + ".curlpart")
     # Докачка с прошлого запуска: если остался .curlpart и URL не с
     # одноразовой подписью (Yandex CDN md5/expires может отдать 403 на
@@ -830,7 +872,11 @@ def download_via_curl(url, dest, timeout=CONNECT_TIMEOUT * 4, extra=None,
              "(WI_INSECURE_SSL=1 включён пользователем)")
     last_err = ""
     tls_note_shown = False
-    for extra in list(attempts):
+    attempts_q = list(attempts)
+    i = 0
+    while i < len(attempts_q):
+        extra = attempts_q[i]
+        i += 1
         # Если базовый заход упал с rc=35, последующие TLS-фиксы
         # (--tlsv1.2 / --http2) должны унаследовать их в HEAD-пробе тоже,
         # иначе _run_curl зависнет на недоступном рукопожатии ещё до GET.
@@ -863,16 +909,39 @@ def download_via_curl(url, dest, timeout=CONNECT_TIMEOUT * 4, extra=None,
         # rc=35 (SSL connect error): пробуем те же запросы, но с другим
         # вариантом TLS — Schannel + TLS 1.3 падает на Cloudflare-доменах
         # (llaun.ch / dl.llaun.ch), а с --tlsv1.2 или --http2 проходит.
+        # ВАЖНО: обходы добавляются ТОЛЬКО пока не доказано, что TLS-руко-
+        # пожатия на этом URL мертвы в принципе. В DPI-сети (RST всем
+        # доменам лаунчера) раньше каждый заход на каждое зеркало тянул
+        # полную цепочку plain -> --noproxy -> --tlsv1.2 -> --http2, т.е.
+        # бюджет из 8 попыток превращался в десятки сетевых запросов и
+        # многоминутное «качается». Первый провал обеих TLS-веток на URL
+        # запоминается (_tls_dead_cache) — повторные касания зеркала
+        # (следующая очередь, повторная команда) делают один быстрый
+        # заход без ретраев.
         if _is_tls_fail(errtxt):
-            if not tls_note_shown:
+            tls_variants = [v for v in (["--tlsv1.2"], ["--http2"])
+                            if list(extra) + v not in attempts_q]
+            if not tls_note_shown and tls_variants:
                 tls_note_shown = True
                 info("  curl: TLS-рукопожатие не прошло (rc=35) — "
                      "пробую обходные варианты (--tlsv1.2 / --http2)")
-            for tlsfix in (["--tlsv1.2"], ["--http2"]):
-                combo = list(extra) + tlsfix
-                if combo in attempts:
-                    continue
-                attempts.append(combo)
+            for tlsfix in tls_variants:
+                attempts_q.append(list(extra) + tlsfix)
+            # Провал захода С TLS-фиксом = этот вариант на этом URL мёртв.
+            # Когда обе ветки (--tlsv1.2 и --http2) доказанно провалились,
+            # дальше ретраить бессмысленно: в DPI-сети RST прилетает всем
+            # рукопожатиям одинаково. Запоминаем это (_tls_dead_cache),
+            # выходим из цикла — и повторные касания зеркала (следующая
+            # очередь зеркал, повторная команда `legacy`) делают ОДИН
+            # быстрый заход без многоминутных ретраев.
+            if any(a in ("--tlsv1.2", "--http2") for a in extra):
+                _mark_tls_dead(url, [a for a in extra
+                                     if a in ("--tlsv1.2", "--http2")])
+                dead_set = {tuple(v) for v in _tls_dead_cache[url]}
+                still_open = [v for v in (["--tlsv1.2"], ["--http2"])
+                              if tuple(v) not in dead_set]
+                if not still_open:
+                    break
     if last_err:
         info(f"  curl не смог: {last_err[:120]}")
     try:
@@ -1023,43 +1092,56 @@ def probe_mirrors_with_curl(mirrors, budget_sec=25):
     if not exe:
         return list(mirrors)
     alive, dead = [], []
+    # Бюджет probe_mirrors_with_curl — на ВСЁ, что он делает. Раньше
+    # `per` гарантировал минимум 5 секунд даже когда до дедлайна осталось
+    # 1 секунда, а каждая проба могла выжечь до 3*per секунд (HEAD, HEAD с
+    # --tlsv1.2, GET'ы с TLS-фиксами) — общий «бюджет 25 секунд» на
+    # деле превращался в 3~4 минуты молчания перед каждой очередью. Это
+    # главный источник ощущения «legacy качается бесконечно» в логах
+    # Windows: очередь из 6+ зеркал обходилась пробой дольше самой сети.
+    # Теперь жёсткий wall-clock: как только deadline пройден — все
+    # оставшиеся зеркала просто едут в конец очереди без сети.
     deadline = time.time() + budget_sec
     for item in mirrors:
         name, url = item[0], item[1]
         if time.time() >= deadline:
             dead.append(item)   # бюджет истёк — остаток в конец очереди
             continue
-        per = max(int(deadline - time.time()), 5)
-        if _curl_head_ok(exe, url, timeout=min(15, per)):
+
+        def _left():
+            return max(int(deadline - time.time()), 1)
+
+        base_extra = _tls_fix_cache.get(url) or []
+        if _curl_head_ok(exe, url, timeout=min(8, _left()),
+                         extra=base_extra or None):
             alive.append(item)
-        elif _curl_head_ok(exe, url, timeout=min(15, per),
-                           extra=["--tlsv1.2"]):
-            debug.dbg(f"probe: {name} жив только с TLS 1.2")
-            _tls_fix_cache[url] = ["--tlsv1.2"]
-            alive.insert(0, item)
+            continue
+        # HEAD не прошёл. Дешёвый тест rc: 35 = TLS-рукопожатие рвётся
+        # (возможны обходы), иначе (6=DNS, 7=conn refused, 28=таймаут) —
+        # зеркало мертво для любых вариантов, дорогих GET-проб не даём.
+        rc = _curl_head_rc(exe, url, timeout=min(6, _left()),
+                           extra=base_extra or None)
+        tlsfix_ok = False
+        if rc == 35:
+            # DPI/Schannel: пробуем GET с ещё не испробованными TLS-
+            # обходами (_tls_variants учитывает _tls_dead_cache — то, что
+            # уже падало на этом URL, повторно НЕ проверяется).
+            for combo in _tls_variants(url, base_extra):
+                if time.time() >= deadline:
+                    break
+                if _curl_get_probe_ok(exe, url, timeout=min(8, _left()),
+                                      extra=combo):
+                    debug.dbg(f"probe: {name} — HEAD рвётся TLS (rc=35), "
+                              f"GET жив с {combo[-1]}")
+                    _tls_fix_cache[url] = list(combo)
+                    tlsfix_ok = True
+                    break
+                _mark_tls_dead(url, combo)
+        if tlsfix_ok:
+            alive.append(item)
         else:
-            # Сетевые фильтры (DPI/прокси) иногда рвут ТОЛЬКО HEAD-запросы,
-            # а обычный GET через curl проходит нормально. Раньше такое
-            # зеркало безоговорочно отодвигалось в конец, и рабочее зеркало
-            # (например llaun.ch) оказывалось заведомо мёртвым — очередь
-            # закачки перепробовала мусор первым. Теперь даём второй шанс:
-            # если HEAD упал именно по TLS (rc=35), пробуем GET с фиксами
-            # --tlsv1.2 / --http2; при успехе запоминаем рабочий фикс.
-            tlsfix_ok = False
-            if _curl_head_rc(exe, url, timeout=min(10, per)) == 35:
-                for tlsfix in (["--tlsv1.2"], ["--http2"]):
-                    if _curl_get_probe_ok(exe, url, timeout=min(15, per),
-                                          extra=tlsfix):
-                        debug.dbg(f"probe: {name} — HEAD рвётся TLS (rc=35), "
-                                  f"GET жив с {tlsfix[0]}")
-                        _tls_fix_cache[url] = list(tlsfix)
-                        tlsfix_ok = True
-                        break
-            if tlsfix_ok:
-                alive.append(item)
-            else:
-                debug.dbg(f"probe: {name} недоступен/медлит — отодвигаю")
-                dead.append(item)
+            debug.dbg(f"probe: {name} недоступен/медлит — отодвигаю")
+            dead.append(item)
     return alive + dead
 
 
@@ -1071,10 +1153,31 @@ def probe_mirrors_with_curl(mirrors, budget_sec=25):
 #: молчания с простынёй ошибок) — см. legacy_try_queues().
 MAX_CURL_QUEUE_ATTEMPTS = 8
 
+#: Жёсткий wall-clock лимит (секунды) на все сетевые заходы run_curl_queues
+#: одной команды. Смысл: «попытка» в DPI-сети стоит не секунду, а десятки
+#: секунд (TLS-ретраивы), поэтому только счётчик попыток не спасал от
+#: ощущения «legacy качается бесконечно». По истечении лимита остаются
+#: лишь мгновенные проверки кэша и локальных файлов.
+MAX_CURL_QUEUE_SECONDS = 240
+
 
 def _curl_attempt_budget(mirrors):
-    """Сколько curl-заходов реально имеет смысл сделать для этой очереди."""
-    return min(len(mirrors), MAX_CURL_QUEUE_ATTEMPTS)
+    """Сколько curl-заходов реально имеет смысл сделать для этой очереди.
+
+    Зеркала, на которых обе TLS-ветки (--tlsv1.2/--http2) уже доказанно
+    провалились (_tls_dead_cache), стоят в бюджете 0: их повторное касание
+    — это один быстрый отказ без ретраев, а не новые десятки секунд. В
+    полностью заблокированной DPI-сети после первого прогона очереди это
+    означает, что вторая команда `legacy` отрабатывает почти мгновенно и
+    честно предлагает рабочий путь (браузер/локальный файл).
+    """
+    cost = 0
+    for _name, url in mirrors:
+        dead = {tuple(v) for v in _tls_dead_cache.get(url, [])}
+        if {("--tlsv1.2",), ("--http2",)} <= dead:
+            continue          # мёртвое зеркало — бесплатно
+        cost += 1
+    return min(cost, MAX_CURL_QUEUE_ATTEMPTS)
 
 
 def run_curl_queues(queues, dest, min_bytes=1024,
@@ -1103,10 +1206,25 @@ def run_curl_queues(queues, dest, min_bytes=1024,
     # allow_full=True — поведение «как раньше»: каждая очередь прогоняется
     # целиком (для мест, где одна очередь уже является полным перебором и
     # второй круга всё равно нет). По умолчанию — жёсткий общий бюджет.
-    budget = total if allow_full else min(total, MAX_CURL_QUEUE_ATTEMPTS)
+    budget = total if allow_full else _curl_attempt_budget(
+        [m for q in cleaned for m in q])
     resume = {"ok": False, "url": None, "attempts": 0, "budget": budget,
               "truncated": budget < total, "mirrors_total": total}
-    if not cleaned or budget <= 0:
+    if not cleaned:
+        return resume
+    if budget <= 0:
+        # Все зеркала уже доказанно TLS-мёртвые (_tls_dead_cache):
+        # повторные сетевые заходы бессмысленны — но мгновенная проверка
+        # кэша/локальных файлов обязательна, иначе скачанный ранее файл
+        # не находился бы без единой попытки (regression-тест
+        # test_run_curl_queues_dead_mirrors_still_check_cache).
+        for queue in cleaned:
+            got = download_queue_with_curl(queue, dest, min_bytes=min_bytes,
+                                           validator=validator,
+                                           silent=silent, max_attempts=0)
+            if got:
+                resume.update(ok=True, url=got, attempts=0)
+                return resume
         return resume
 
     def _valid(p):
@@ -1122,9 +1240,26 @@ def run_curl_queues(queues, dest, min_bytes=1024,
     exe = shutil_which_curl()
     per_queue = max(budget // len(cleaned), 1) if len(cleaned) > 1 else budget
     spent = 0
+    # Жёсткий wall-clock дедлайн на ВСЕ сетевые заходы команды. Бюджет в
+    # «попытках» сам по себе не спасает: каждая попытка в DPI-сети тянула
+    # десятки секунд (plain -> --noproxy -> --tlsv1.2 -> --http2 с
+    # таймаутами), и две очереди превращались в полчаса «качается».
+    # MAX_CURL_QUEUE_SECONDS ограничивает суммарное время; после его
+    # истечения остаются только мгновенные проверки кэша/локальных файлов.
+    deadline = time.time() + MAX_CURL_QUEUE_SECONDS
+    # Прогноз времени: пользователь не должен гадать, «зависло или
+    # качается» — печатаем оценку ДО первой сетевой операции.
+    if not silent and total > 0:
+        info(f"Закачка: до {budget} попыток по {total} зеркалам, "
+             f"лимит ~{MAX_CURL_QUEUE_SECONDS // 60} мин (обычно секунды — "
+             f"живое зеркало находится сразу)")
     for qi, queue in enumerate(cleaned):
         remaining = budget - spent
         if remaining <= 0:
+            break
+        if time.time() > deadline:
+            debug.dbg("run_curl_queues: wall-clock лимит исчерпан — "
+                      "сетевые заходы прекращены", level="WARN")
             break
         # Хвост очереди не режем: запасное зеркало (например Yandex CDN,
         # отдающий .exe-установщик) обычно стоит последним элементом, и
