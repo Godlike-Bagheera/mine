@@ -43,7 +43,8 @@ from modules.wine import (
 from modules.debug import rotate_old_logs
 from modules.art import print_art
 from modules.config import ARIA2C_MIRRORS, MIN_ARIA2C_SIZE, BIN_DIR
-from modules.download import try_download_manual, cmd_netcheck
+from modules.download import (try_download_manual, cmd_netcheck,
+                              ensure_clean_network, cmd_netrestore)
 
 
 def _setup_readline():
@@ -144,6 +145,10 @@ def print_help():
     print(f"  {CYAN}debugreport{RESET}         — архив логов")
     print(f"  {CYAN}netcheck{RESET}            — диагностика сети/DNS "
           f"(если «недоступные домены» при живом интернете)")
+    print(f"  {CYAN}netfix{RESET}             — автопочинка: выключить прокси "
+          f"Windows + поставить DNS 77.88.8.8/8.8.8.8 (с подтверждением)")
+    print(f"  {CYAN}netrestore{RESET}         — вернуть прокси/DNS, которые "
+          f"менял netfix")
     print(f"{BOLD}── Прочее ────────────────────────────────────────{RESET}")
     print(f"  {CYAN}history{RESET}, {CYAN}log{RESET}         — история / последний лог")
     print(f"  {CYAN}help{RESET}, {CYAN}?{RESET}             — эта справка")
@@ -193,6 +198,10 @@ COMMAND_REGISTRY = {
     "netcheck": lambda a="": cmd_netcheck(),
     "диагностикасети": lambda a="": cmd_netcheck(),
     "проверкасвязи": lambda a="": cmd_netcheck(),
+    "netfix": lambda a="": ensure_clean_network(),
+    "починкисети": lambda a="": ensure_clean_network(),
+    "netrestore": lambda a="": cmd_netrestore(),
+    "вернутьсеть": lambda a="": cmd_netrestore(),
     "games": lambda a="": cmd_games_list(), "игры": lambda a="": cmd_games_list(),
     "minecraft": lambda a="": cmd_minecraft(), "майнкрафт": lambda a="": cmd_minecraft(),
     "fo": lambda a="": setup_fabulously_optimized(),
@@ -419,8 +428,9 @@ def _netcheck_summary():
         elif blocked:
             warn(f"DNS-блокировка: {', '.join(blocked)} — интернет есть, "
                  f"но провайдер перехватывает эти домены.")
-            hint("Поставь DNS 77.88.8.8 / 8.8.8.8; подробности: команда "
-                 f"{CYAN}netcheck{RESET}")
+            hint("Команда netfix — выключит прокси и поставит DNS "
+                 "77.88.8.8 / 8.8.8.8 (с подтверждением); подробности: "
+                 f"команда {CYAN}netcheck{RESET}")
         else:
             ok("DNS: домены лаунчера резолвятся корректно")
     except Exception as e:
@@ -441,6 +451,17 @@ def print_diagnostics():
         except Exception as e:
             debug.dbg_exc(e, "print_diagnostics/sysinfo")
             warn("Не удалось собрать инфо о железе")
+        # Сеть: состояние прокси из реестра — частая причина «интернета нет»
+        try:
+            from modules.download import windows_ie_proxy
+            px = windows_ie_proxy()
+            if px["enabled"]:
+                warn(f"Прокси Windows: ВКЛЮЧЕН ({px['server'] or 'адрес не указан'}) "
+                     f"— мешает загрузкам; команда netfix выключит")
+            else:
+                ok("Прокси Windows: выключен")
+        except Exception as e:
+            debug.dbg_exc(e, "print_diagnostics/proxy")
         mc_dirs = find_minecraft_dirs(limit=8)
         if mc_dirs:
             for d in mc_dirs[:5]:
@@ -564,6 +585,11 @@ def main():
 
     if IS_WINDOWS:
         # ── Нативный путь Windows 10: Wine/DXVK/winetricks не нужны вовсе ──
+        # Сперва чиним сеть: в общих сетях прокси из реестра рвёт TLS у
+        # Python/curl, а кастомный DNS подменяет домены лаунчера — без этого
+        # любая загрузка выглядит как «интернета нет». (С подтверждением;
+        # откат — netrestore.)
+        ensure_clean_network()
         java_bin, java_home, java_status = find_java()
         if java_home or java_bin:
             ok(f"Java найдена: {java_home or java_bin}")

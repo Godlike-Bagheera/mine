@@ -83,22 +83,42 @@ if %ERRORLEVEL%==0 (
         REM Если в локальной копии есть незакоммиченные правки — не даём им
         REM блокировать pull (раньше из-за этого pull падал и скрипт мог
         REM закрыться, не дойдя до запуска).
+        REM -c http.proxy= -c https.proxy= — игнорируем системный/школьный
+        REM прокси: он рвёт TLS к github.com («интернет как будто нет»).
         git -C "%DEST%" stash -q >nul 2>nul
-        git -C "%DEST%" pull --ff-only
+        git -C "%DEST%" -c http.proxy= -c https.proxy= pull --ff-only
+        if errorlevel 1 (
+            echo  [!] git pull не прошёл. Похоже на блокировку прокси/DNS:
+            echo      проверь настройки прокси ^(netfix в launcher.py^) или выполни вручную:
+            echo      git config --global --unset http.proxy ^&^& git config --global --unset https.proxy
+            echo      netsh winhttp reset proxy
+            echo      Пробую PowerShell-фоллбек...
+            goto :pszip
+        )
     ) else (
         echo  [..] Клонирую репозиторий через git...
-        git clone --depth 1 "%REPO_URL%" "%DEST%"
+        git -c http.proxy= -c https.proxy= clone --depth 1 "%REPO_URL%" "%DEST%"
+        if errorlevel 1 (
+            echo  [!] git clone не прошёл. Похоже на блокировку прокси/DNS:
+            echo      отключи прокси Windows ^(Параметры - Сеть и Интернет - Прокси^)
+            echo      или выполни в cmd от администратора: netsh winhttp reset proxy
+            echo      Пробую PowerShell-фоллбек...
+            goto :pszip
+        )
     )
     goto :run
 )
 
 REM ---------- способ 2: PowerShell + zip ----------
-echo  [..] Git не найден - качаю zip-архив через PowerShell...
+:pszip
+echo  [..] Git недоступен - качаю zip-архив через PowerShell...
+REM -Proxy $null заставляет Invoke-WebRequest игнорировать системный
+REM прокси WinHTTP/IE — иначе школьный фильтр рвёт загрузку архива.
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "$ErrorActionPreference='Stop';" ^
   "$ProgressPreference='SilentlyContinue';" ^
   "New-Item -ItemType Directory -Force -Path '%TEMP%\mcinst' | Out-Null;" ^
-  "Invoke-WebRequest -Uri '%ZIP_URL%' -OutFile '%TEMP%\mcinst\main.zip';" ^
+  "Invoke-WebRequest -Uri '%ZIP_URL%' -OutFile '%TEMP%\mcinst\main.zip' -Proxy $null;" ^
   "Expand-Archive -Force '%TEMP%\mcinst\main.zip' '%TEMP%\mcinst\ext';" ^
   "if (Test-Path '%DEST%') { Remove-Item -Recurse -Force '%DEST%' };" ^
   "Move-Item '%TEMP%\mcinst\ext\mine-main' '%DEST%'"

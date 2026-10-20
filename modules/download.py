@@ -547,7 +547,7 @@ def _curl_head_size(exe, url, timeout=15, extra=None):
                "--max-time", str(timeout),
                "--location-trusted",
                "--user-agent", CURL_BROWSER_UA] \
-            + list(extra or []) + [url]
+            + _curl_noproxy_args() + list(extra or []) + [url]
         r = subprocess.run(cmd, check=False, timeout=timeout + 5,
                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         for line in (r.stdout or b"").decode("utf-8", errors="ignore").splitlines():
@@ -574,9 +574,8 @@ def _curl_http_code(exe, url, timeout=15):
                "--connect-timeout", str(max(timeout // 3, 5)),
                "--max-time", str(timeout),
                "--user-agent", CURL_BROWSER_UA,
-               "-w", "%{http_code}", url]
-        if windows_ie_proxy()["enabled"]:
-            cmd += ["--noproxy", "*"]
+               "-w", "%{http_code}"] \
+        + _curl_noproxy_args() + [url]
         r = subprocess.run(cmd, check=False, timeout=timeout + 10,
                            stdout=subprocess.PIPE,
                            stderr=subprocess.DEVNULL)
@@ -1102,9 +1101,14 @@ def probe_mirrors_with_curl(mirrors, budget_sec=25):
     # Теперь жёсткий wall-clock: как только deadline пройден — все
     # оставшиеся зеркала просто едут в конец очереди без сети.
     deadline = time.time() + budget_sec
+    budget_exhausted = False
     for item in mirrors:
         name, url = item[0], item[1]
         if time.time() >= deadline:
+            if not budget_exhausted:
+                budget_exhausted = True
+                debug.dbg(f"probe: бюджет {budget_sec}с исчерпан — "
+                          f"оставшиеся зеркала без проб", level="WARN")
             dead.append(item)   # бюджет истёк — остаток в конец очереди
             continue
 
@@ -1142,6 +1146,10 @@ def probe_mirrors_with_curl(mirrors, budget_sec=25):
         else:
             debug.dbg(f"probe: {name} недоступен/медлит — отодвигаю")
             dead.append(item)
+    if budget_exhausted:
+        warn(f"Проба зеркал: бюджет {budget_sec} с исчерпан — "
+             f"{len(dead)} из {len(mirrors)} зеркал не проверялись "
+             f"(встали в конец очереди, закачка всё равно их попробует).")
     return alive + dead
 
 
@@ -1444,6 +1452,33 @@ def _is_resetlike(e):
     return "10054" in s or "reset by peer" in s or "timed out" in s
 
 
+def _no_proxy_handler():
+    """ProxyHandler({}) — обход системного прокси для urllib.
+
+    urllib по умолчанию (getproxies()) подхватывает прокси из реестра
+    Windows и переменных окружения. В школьной сети это именно тот
+    фильтрующий прокси, который рвёт TLS («Missing Authority Key
+    Identifier») и буферизует закачку — а все зеркала проекта (GitHub,
+    Mojang, llaun.ch) доступны напрямую. Поэтому основной сетевой путь
+    идёт строго мимо прокси; через сам прокси пробуем отдельно
+    (open_system_proxy) — если прямое соединение блокирует файрвол.
+    """
+    return urllib.request.ProxyHandler({})
+
+
+_urllib_opener = None
+
+
+def _strict_opener():
+    """Кэшированный opener urllib без системного прокси."""
+    global _urllib_opener
+    if _urllib_opener is None:
+        _urllib_opener = urllib.request.build_opener(
+            _no_proxy_handler(),
+            urllib.request.HTTPSHandler(context=net.ssl_ctx()))
+    return _urllib_opener
+
+
 def open_checked(req, timeout):
     """urlopen с единым (строгим) SSL-контекстом net.ssl_ctx().
 
@@ -1454,6 +1489,10 @@ def open_checked(req, timeout):
     понятная подсказка. Insecure-режим включается ТОЛЬКО явно:
     WI_INSECURE_SSL=1 (тогда net.ssl_ctx сам строит CERT_NONE-контекст).
 
+    Системный прокси ОБХОДИТСЯ (ProxyHandler({})) — см. _no_proxy_handler:
+    раньше запросы шли через включённый школьный прокси и падали ещё до
+    TLS, что выглядело как «интернета нет».
+
     Если обычное соединение разорвано (WinError 10054 / ECONNRESET /
     RemoteDisconnected — так ведут себя CDN против «небраузерных» клиентов),
     автоматически делается вторая попытка: браузерные заголовки + прямой
@@ -1461,8 +1500,7 @@ def open_checked(req, timeout):
     """
     _browser_headers(req)
     try:
-        return urllib.request.urlopen(req, context=net.ssl_ctx(),
-                                      timeout=timeout)
+        return _strict_opener().open(req, timeout=timeout)
     except (ConnectionResetError, http.client.RemoteDisconnected,
             BrokenPipeError, socket.timeout) as e:
         debug.dbg(f"open-checked reset ({e!r}), пробую raw-сокет: "
@@ -1499,8 +1537,11 @@ def open_checked(req, timeout):
                 ctx = _windows_ctx()
                 if ctx is not None:
                     try:
-                        return urllib.request.urlopen(req, context=ctx,
-                                                      timeout=timeout)
+                        # Без прокси — как и основной путь (см. docstring).
+                        opener = urllib.request.build_opener(
+                            _no_proxy_handler(),
+                            urllib.request.HTTPSHandler(context=ctx))
+                        return opener.open(req, timeout=timeout)
                     except urllib.error.URLError:
                         pass  # падаем в стандартное сообщение ниже
             if not _insecure_fallback_allowed():
@@ -1984,17 +2025,29 @@ def _dns_query_a(hostname, server, timeout=4):
         return []
 
 
+#: Контрольные «нейтральные» домены: если все рабочие домены резолвятся в
+#: ОДИН и тот же IP, а эти — в другой единственный IP, перед нами заглушка
+#: фильтра (DNS перехватывает только запрещённые имена).
+NETCHECK_CONTROL_DOMAINS = ["google.com", "microsoft.com"]
+
+
 def diagnose_dns(domains=None):
     """Сравнивает системный DNS с публичным по списку доменов.
 
     Возвращает dict: {domain: {"system": [ip...], "public": {server: [ip...]},
     "verdict": str}}. verdict:
-      ok            — резолвится везде более-менее одинаково
-      dns_block     — системный DNS не отдаёт ничего/LOPHIBUR, публичный — да
-                      (перехват/блокировка провайдером)
+      ok            — резолвится и совпадает с публичным DNS
+      dns_block     — системный DNS перехвачен: пустой ответ / LOPHIBUR /
+                      подмена на IP, которого нет ни в одном публичном
+                      ответе (RPZ-заглушки школьных фильтров тоже здесь)
       no_internet   — не резолвится НИЧЕГДА, даже через 8.8.8.8
     """
-    domains = domains or NETCHECK_DOMAINS
+    domains = list(domains or NETCHECK_DOMAINS)
+    # Контрольные домены нужны для распознавания заглушек-фильтров; дубликаты
+    # из явного списка убираем (cmd_netcheck печатает результат по всем ключам).
+    for c in NETCHECK_CONTROL_DOMAINS:
+        if c not in domains:
+            domains.append(c)
     results = {}
     for dom in domains:
         entry = {"system": [], "public": {}, "verdict": ""}
@@ -2005,17 +2058,329 @@ def diagnose_dns(domains=None):
             debug.dbg(f"system dns {dom}: {e}", level="WARN")
         for server, _name in PUBLIC_DNS:
             entry["public"][server] = _dns_query_a(dom, server)
-        pub_ok = any(entry["public"].values())
-        sys_ip = entry["system"]
-        sys_lophi = bool(sys_ip) and all(ip.startswith("127.")
-                                         or ip.startswith("128.0.101.")
-                                         for ip in sys_ip)
-        if not sys_ip or sys_lophi:
-            entry["verdict"] = "dns_block" if pub_ok else "no_internet"
-        else:
+        pub_ips = set()
+        for ips in entry["public"].values():
+            pub_ips.update(ips)
+        sys_ips = set(entry["system"])
+        sys_lophi = bool(sys_ips) and all(ip.startswith("127.")
+                                          or ip.startswith("128.0.101.")
+                                          for ip in sys_ips)
+        if not sys_ips or sys_lophi:
+            # Пустой ответ или LOPHIBUR (РосТелеком/МТС-перехват)
+            entry["verdict"] = "dns_block" if pub_ips else "no_internet"
+        elif not pub_ips:
+            # Системный отвечает, публичные молчат: UDP:53 наружу заблокирован
+            # — интернет проверить нельзя; считаем ok, чтобы не гнать ложный
+            # автофикс DNS (реальную доступность покажет HTTPS-часть netcheck).
             entry["verdict"] = "ok"
+        elif sys_ips & pub_ips:
+            # Пересечение с публичными ответами — резолв честный
+            entry["verdict"] = "ok"
+        else:
+            # Системный DNS отдаёт адреса, которых НЕТ у Яндекса/Google —
+            # подмена (RPZ-заглушка фильтра). Отдельный признак-подсказку
+            # («одна заглушка на все домены») добавляет ensure_clean_network.
+            entry["verdict"] = "dns_block"
         results[dom] = entry
     return results
+
+
+def get_system_dns_servers():
+    """DNS-серверы активных интерфейсов Windows (PowerShell, без админа).
+
+    Возвращает список уникальных IPv4; при любой ошибке — [].
+    """
+    servers = []
+    try:
+        from modules.platform_utils import IS_WINDOWS as _IS_WIN
+        if not _IS_WIN:
+            return servers
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-DnsClientServerAddress -AddressFamily IPv4 | "
+             "Where-Object ServerAddresses | "
+             "ForEach-Object { $_.ServerAddresses }"],
+            capture_output=True, text=True, timeout=20)
+        for line in (r.stdout or "").splitlines():
+            ip = line.strip()
+            if ip and ip.count(".") == 3 and ip not in servers:
+                servers.append(ip)
+    except Exception as e:
+        debug.dbg(f"get_system_dns_servers: {e}", level="WARN")
+    return servers
+
+
+def windows_ie_proxy_set(enabled):
+    """Переключает ProxyEnable в HKCU\\...\\Internet Settings (права юзера).
+
+    True -> 1, False -> 0. Возвращает True при успехе.
+    """
+    try:
+        import winreg
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+            0, winreg.KEY_SET_VALUE)
+        with key:
+            winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD,
+                              1 if enabled else 0)
+        try:
+            import ctypes
+            ctypes.windll.wininet.InternetSetOptionW(
+                0, 39, 0, 0)   # INTERNET_OPTION_SETTINGS_CHANGED
+            ctypes.windll.wininet.InternetSetOptionW(
+                0, 37, 0, 0)   # INTERNET_OPTION_REFRESH
+        except Exception:
+            pass
+        return True
+    except Exception as e:
+        debug.dbg(f"windows_ie_proxy_set: {e}", level="WARN")
+        return False
+
+
+def disable_winhttp_proxy():
+    """netsh winhttp reset proxy (нужны права администратора).
+
+    Возвращает True при успехе; при отказе — False и текст ошибки в dbg.
+    """
+    try:
+        r = subprocess.run(["netsh", "winhttp", "reset", "proxy"],
+                           capture_output=True, text=True, timeout=20)
+        out = ((r.stdout or "") + (r.stderr or "")).strip()
+        if r.returncode == 0:
+            debug.dbg(f"winhttp reset proxy: {out}")
+            return True
+        debug.dbg(f"winhttp reset proxy failed (rc={r.returncode}): {out}",
+                  level="WARN")
+    except Exception as e:
+        debug.dbg(f"disable_winhttp_proxy: {e}", level="WARN")
+    return False
+
+
+def _ask_yes_no(question, default=True):
+    """Да/Нет-вопрос в REPL; Enter = default; не-TTY (пайп/CI) = default."""
+    suffix = " [Y/n]: " if default else " [y/N]: "
+    try:
+        if not sys.stdin.isatty():
+            return default
+    except Exception:
+        return default
+    try:
+        ans = input(question + suffix).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    if not ans:
+        return default
+    return ans in ("y", "yes", "да", "д", "+", "1")
+
+
+def _net_save(key, value):
+    from modules.settings import load_settings, save_settings
+    s = load_settings()
+    s[key] = value
+    save_settings(s)
+
+
+def _net_load(key, default=None):
+    from modules.settings import load_settings
+    return load_settings().get(key, default)
+
+
+def ensure_clean_network(interactive=True):
+    """Проверка и (с согласия) починка сети Windows перед загрузками.
+
+    Делает две вещи:
+      1. Прокси: если ProxyEnable=1 — предлагает выключить (запись
+         ProxyEnable=0 в HKCU\\...\\Internet Settings, права обычного
+         пользователя достаточно) + `netsh winhttp reset proxy` (для него
+         нужен админ — при отказе прав печатает инструкцию). Оригинал
+         (адрес прокси и флаг) сохраняется в settings.json — вернуть:
+         команда `netrestore`.
+      2. DNS: собирает вердикты diagnose_dns(); если есть dns_block и
+         системные DNS нестандартные — сохраняет их в settings.json и
+         предлагает поставить 77.88.8.8 / 8.8.8.8 (netsh interface ip
+         set dns, нужны права админа — при Access denied инструкция).
+
+    Вызывается из ui.main() на старте (только Windows), а также командой
+    `netfix`. Никаких исключений наружу не выпускает.
+    """
+    try:
+        from modules.platform_utils import IS_WINDOWS as _IS_WIN
+        if not _IS_WIN:
+            return
+        fixed = []
+
+        # ── 1. Прокси ──────────────────────────────────────────────
+        px = windows_ie_proxy()
+        if px["enabled"]:
+            server = px["server"] or "(адрес не указан)"
+            warn(f"В настройках Windows включён прокси ({server}).")
+            hint("Он рвёт TLS-рукопожатия Python/curl и буферит закачку — "
+                 "именно он чаще всего даёт «интернета как будто нет».")
+            do = interactive and _ask_yes_no("Выключить прокси сейчас?")
+            if do:
+                prev = _net_load("net_original_proxy")
+                if prev is None:
+                    _net_save("net_original_proxy",
+                              {"enabled": True, "server": px["server"]})
+                if windows_ie_proxy_set(False):
+                    ok("Прокси (IE/HKCU) выключен. Вернуть: команда netrestore")
+                    fixed.append("proxy")
+                else:
+                    err("Не удалось выключить прокси в реестре — "
+                        "Параметры -> Сеть и Интернет -> Прокси вручную.")
+                if not disable_winhttp_proxy():
+                    hint("Служебный прокси WinHTTP не сброшен (нужен админ): "
+                         "в cmd от администратора выполни "
+                         "`netsh winhttp reset proxy`")
+            elif interactive:
+                hint("Отключить вручную: Параметры -> Сеть и Интернет -> "
+                     "Прокси -> «Использовать прокси-сервер» = ОТКЛ")
+
+        # ── 2. DNS ─────────────────────────────────────────────────
+        res = diagnose_dns(NETCHECK_DOMAINS[:4])
+        blocked = [d for d, r in res.items() if r["verdict"] == "dns_block"]
+        if blocked:
+            servers = get_system_dns_servers()
+            custom = [s for s in servers
+                      if s not in ("8.8.8.8", "8.8.4.4", "77.88.8.8",
+                                   "77.88.8.1", "1.1.1.1", "9.9.9.9")]
+            stub_ips = {tuple(sorted(r["system"])) for r in res.values()
+                        if r["verdict"] == "dns_block" and r["system"]}
+            stub_msg = (" — все блокировки ведут на одну заглушку "
+                        f"{', '.join(stub_ips.pop())}" if len(stub_ips) == 1
+                        and servers else "")
+            warn(f"Системный DNS подменяет/не отдаёт {len(blocked)} домен(ов): "
+                 f"{', '.join(blocked)}{stub_msg}")
+            if servers:
+                info(f"Текущие DNS-серверы: {', '.join(servers)}")
+            do = interactive and _ask_yes_no(
+                f"Сменить DNS на {PUBLIC_DNS[0][0]} / {PUBLIC_DNS[1][0]}?")
+            if do:
+                if servers and _net_load("net_original_dns") is None:
+                    _net_save("net_original_dns", servers)
+                if set_dns_servers(PUBLIC_DNS[0][0], PUBLIC_DNS[1][0]):
+                    ok(f"DNS установлен: {PUBLIC_DNS[0][0]} / "
+                       f"{PUBLIC_DNS[1][0]}. Вернуть: команда netrestore")
+                    fixed.append("dns")
+                    res2 = diagnose_dns(NETCHECK_DOMAINS[:4])
+                    still = [d for d, r in res2.items()
+                             if r["verdict"] == "dns_block"]
+                    if still:
+                        hint("После смены DNS часть доменов всё ещё "
+                             "подменяется — вероятно, фильтр на уровне "
+                             "прокси/DPI, а не DNS.")
+                else:
+                    err("Не удалось сменить DNS (нужны права администратора).")
+                    iface = _default_interface() or "<Имя подключения>"
+                    hint(f"В cmd ОТ АДМИНИСТРАТОРА: netsh interface ip set "
+                         f"dns \"{iface}\" static {PUBLIC_DNS[0][0]}")
+                    hint(f"и: netsh interface ip add dns \"{iface}\" "
+                         f"{PUBLIC_DNS[1][0]} index=2")
+        # Итог: если чинили — перечитать состояние прокси для curl-флагов
+        if fixed:
+            global _proxy_warned
+            _proxy_warned = False
+            debug.dbg(f"ensure_clean_network: исправлено {fixed}")
+    except Exception as e:
+        debug.dbg_exc(e, "ensure_clean_network")
+
+
+def _default_interface():
+    """Имя активного IPv4-интерфейса Windows (для netsh), или None."""
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "(Get-NetRoute 0.0.0.0/0 | "
+             "Sort-Object RouteMetric | Select-Object -First 1 "
+             "-ExpandInterfaceAlias)"],
+            capture_output=True, text=True, timeout=20)
+        name = (r.stdout or "").strip().splitlines()
+        return name[-1].strip() if name else None
+    except Exception as e:
+        debug.dbg(f"_default_interface: {e}", level="WARN")
+        return None
+
+
+def set_dns_servers(primary, secondary=None, iface=None):
+    """Меняет DNS статически на интерфейс(ы) Windows через netsh (админ).
+
+    primary обязателен, secondary добавляется index=2. Если задан iface —
+    работаем только с ним, иначе со всеми активными Ethernet/WLAN.
+    Возвращает True, если хотя бы один netsh-вызов прошёл успешно.
+    """
+    try:
+        from modules.platform_utils import IS_WINDOWS as _IS_WIN
+        if not _IS_WIN:
+            return False
+        ifaces = [iface] if iface else _list_active_interfaces()
+        if not ifaces:
+            return False
+        any_ok = False
+        for it in ifaces:
+            cmd1 = ["netsh", "interface", "ip", "set", "dns", it,
+                    "static", primary]
+            r = subprocess.run(cmd1, capture_output=True, text=True,
+                               timeout=20)
+            out = ((r.stdout or "") + (r.stderr or "")).lower()
+            if r.returncode != 0 or "denied" in out or "отказано" in out:
+                debug.dbg(f"set_dns on '{it}': rc={r.returncode} {out.strip()}",
+                          level="WARN")
+                continue
+            any_ok = True
+            if secondary:
+                subprocess.run(["netsh", "interface", "ip", "add", "dns", it,
+                                secondary, "index=2"],
+                               capture_output=True, text=True, timeout=20)
+        return any_ok
+    except Exception as e:
+        debug.dbg(f"set_dns_servers: {e}", level="WARN")
+        return False
+
+
+def _list_active_interfaces():
+    """Имена активных (подключённых) Ethernet/WLAN-интерфейсов Windows."""
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-NetAdapter | Where-Object Status -eq 'Up' | "
+             "Select-Object -ExpandProperty Name"],
+            capture_output=True, text=True, timeout=20)
+        return [ln.strip() for ln in (r.stdout or "").splitlines()
+                if ln.strip()]
+    except Exception as e:
+        debug.dbg(f"_list_active_interfaces: {e}", level="WARN")
+        return []
+
+
+def cmd_netrestore():
+    """Команда netrestore: вернуть прокси/DNS, сохранённые netfix/netcheck."""
+    from modules.platform_utils import IS_WINDOWS as _IS_WIN
+    if not _IS_WIN:
+        hint("netrestore доступна только на Windows.")
+        return
+    restored = []
+    px = _net_load("net_original_proxy")
+    if px is not None:
+        if windows_ie_proxy_set(bool(px.get("enabled"))):
+            ok(f"Прокси восстановлен: "
+               f"{'вкл (' + str(px.get('server')) + ')' if px.get('enabled') else 'выкл'}")
+            restored.append("proxy")
+        else:
+            err("Не удалось восстановить прокси в реестре.")
+    dns = _net_load("net_original_dns")
+    if dns:
+        first, second = dns[0], (dns[1] if len(dns) > 1 else None)
+        if set_dns_servers(first, second):
+            ok(f"DNS восстановлен: {', '.join(dns)}")
+            restored.append("dns")
+        else:
+            err("Не удалось вернуть DNS (нужны права администратора): "
+                f"netsh interface ip set dns \"<Интерфейс>\" static {first}")
+    if not restored:
+        info("Нечего восстанавливать — netfix ничего не менял "
+             "(сохранений в settings.json нет).")
 
 
 def check_reachable(url, timeout=8):
@@ -2050,7 +2415,10 @@ def cmd_netcheck():
     if blocked:
         warn(f"DNS-перехват затронул {len(blocked)} домен(ов): "
              f"{', '.join(blocked)}")
-        hint("Решение: поставь DNS 77.88.8.8 / 8.8.8.8 "
+        hint("Быстрый автофикс (с подтверждением): команда netfix "
+             "(отключит прокси и поставит 77.88.8.8/8.8.8.8; отмена — "
+             "netrestore)")
+        hint("Вручную: Поставь DNS 77.88.8.8 / 8.8.8.8 "
              "(Параметры сети → IPv4 → использовать следующие серверы)")
     if dead and len(dead) == len(res):
         err("Похоже, интернет действительно отсутствует "
