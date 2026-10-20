@@ -221,7 +221,7 @@ EXPECTED_COMMANDS = [
     "help", "exit", "minecraft", "download", "fonts", "steamfix",
     "gamemode", "history", "log", "quiet", "reset", "dxvk",
     "desktop", "vulkan", "settings", "bin", "verify", "update",
-    "debug", "debugreport", "install-java",
+    "debug", "debugreport", "install-java", "netcheck",
     "fo", "ofps", "optifine", "prism", "legacy",
     "export", "gpu-temp", "freegames",
     "worlds", "saveworlds", "loadworlds",

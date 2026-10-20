@@ -1571,3 +1571,178 @@ def _redraw_parallel():
             sys.stdout.write("\033[F")
         sys.stdout.write("\r")
     sys.stdout.flush()
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  ДИАГНОСТИКА СЕТИ (netcheck)
+#  Лечит симптом «похоже, что у ПК выключен интернет, хотя он включён»:
+#  когда Legacy Launcher показывает «Список недоступных доменов»
+#  (account.ely.by / launchermeta.mojang.com / proxy.legacylauncher.ru /
+#  proxy.llaun.ch), чаще всего дело не в отсутствии интернета, а в
+#  битом/перехваченном DNS провайдера или в DPI-блокировке конкретных
+#  доменов. Функции ниже это различают.
+# ═══════════════════════════════════════════════════════════════════
+
+#: Домены, которые сам лаунчер Java обычно не может достать в проблемных
+#: сетях — их список пользователь видит в окне «Список недоступных доменов».
+NETCHECK_DOMAINS = [
+    "account.ely.by",
+    "launchermeta.mojang.com",
+    "piston-meta.mojang.com",
+    "proxy.legacylauncher.ru",
+    "proxy.llaun.ch",
+    "llaun.ch",
+]
+
+#: Публичные DNS для контрольного резолвинга (Яндекс и Google).
+PUBLIC_DNS = [("77.88.8.8", "Яндекс DNS"), ("8.8.8.8", "Google DNS")]
+
+
+def _dns_query_a(hostname, server, timeout=4):
+    """Минимальный DNS A-запрос (прямые сокеты, без внешних зависимостей).
+
+    Возвращает список IPv4-адресов; при таймауте/битом ответе — пустой
+    список. Нужен, чтобы сравнить: домен резолвится через системный DNS
+    или только через публичный (признак перехвата/блокировки провайдером).
+    """
+    import struct
+    try:
+        labels = b"".join(bytes([len(p)]) + p.encode("ascii", "ignore")
+                          for p in hostname.rstrip(".").split(".")) + b"\x00"
+        # заголовок: id, flags (standard query, RD=1), QDCOUNT=1, остальные 0
+        header = struct.pack(">HHHHHH", 0xBEEF, 0x0100, 1, 0, 0, 0)
+        query = header + labels + struct.pack(">HH", 1, 1)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
+        try:
+            sock.sendto(query, (server, 53))
+            data, _ = sock.recvfrom(4096)
+        finally:
+            sock.close()
+        if len(data) < 12:
+            return []
+        qdcount, ancount = struct.unpack(">HH", data[4:8])
+        # пропускаем заголовок и вопросы
+        pos = 12
+        for _ in range(qdcount):
+            while pos < len(data):
+                ln = data[pos]
+                if ln == 0:
+                    pos += 1
+                    break
+                if ln & 0xC0:          # сжатое имя — указатель 2 байта
+                    pos += 2
+                    break
+                pos += 1 + ln
+            pos += 4                   # QTYPE + QCLASS
+        ips = []
+        for _ in range(ancount):
+            if pos + 10 > len(data):
+                break
+            # имя (сжатое или метки)
+            if data[pos] & 0xC0:
+                pos += 2
+            else:
+                while pos < len(data) and data[pos]:
+                    if data[pos] & 0xC0:
+                        pos += 2
+                        break
+                    pos += 1 + data[pos]
+                pos += 1
+            rtype, rclass, _ttl, rdlen = struct.unpack(">HHIH",
+                                                       data[pos:pos + 10])
+            pos += 10
+            rdata = data[pos:pos + rdlen]
+            pos += rdlen
+            if rtype == 1 and rclass == 1 and rdlen == 4:
+                ips.append(".".join(str(b) for b in rdata))
+        return ips
+    except Exception as e:
+        debug.dbg(f"dns_query({hostname}@{server}): {e}", level="WARN")
+        return []
+
+
+def diagnose_dns(domains=None):
+    """Сравнивает системный DNS с публичным по списку доменов.
+
+    Возвращает dict: {domain: {"system": [ip...], "public": {server: [ip...]},
+    "verdict": str}}. verdict:
+      ok            — резолвится везде более-менее одинаково
+      dns_block     — системный DNS не отдаёт ничего/LOPHIBUR, публичный — да
+                      (перехват/блокировка провайдером)
+      no_internet   — не резолвится НИЧЕГДА, даже через 8.8.8.8
+    """
+    domains = domains or NETCHECK_DOMAINS
+    results = {}
+    for dom in domains:
+        entry = {"system": [], "public": {}, "verdict": ""}
+        try:
+            infos = socket.getaddrinfo(dom, None, socket.AF_INET)
+            entry["system"] = sorted({i[4][0] for i in infos})
+        except Exception as e:
+            debug.dbg(f"system dns {dom}: {e}", level="WARN")
+        for server, _name in PUBLIC_DNS:
+            entry["public"][server] = _dns_query_a(dom, server)
+        pub_ok = any(entry["public"].values())
+        sys_ip = entry["system"]
+        sys_lophi = bool(sys_ip) and all(ip.startswith("127.")
+                                         or ip.startswith("128.0.101.")
+                                         for ip in sys_ip)
+        if not sys_ip or sys_lophi:
+            entry["verdict"] = "dns_block" if pub_ok else "no_internet"
+        else:
+            entry["verdict"] = "ok"
+        results[dom] = entry
+    return results
+
+
+def check_reachable(url, timeout=8):
+    """Быстрая HEAD/GET-проверка доступности HTTPS-URL. True/False."""
+    try:
+        req = urllib.request.Request(
+            url, method="HEAD",
+            headers={"User-Agent": CURL_BROWSER_UA})
+        with open_checked(req, timeout) as r:
+            return 200 <= getattr(r, "status", 200) < 400
+    except Exception as e:
+        debug.dbg(f"reachable {url}: {e}", level="WARN")
+        return False
+
+
+def cmd_netcheck():
+    """Команда netcheck: диагностика «интернет есть, а домены недоступны»."""
+    info("=== Диагностика сети (netcheck) ===")
+    res = diagnose_dns()
+    blocked, dead = [], []
+    for dom, entry in res.items():
+        mark = {"ok": "✅", "dns_block": "🚫", "no_internet": "❌"}[entry["verdict"]]
+        sysv = ", ".join(entry["system"]) or "—(не резолвится)"
+        print(f"  {mark} {dom:28} system: {sysv}")
+        if entry["verdict"] == "dns_block":
+            blocked.append(dom)
+            good = next((ips for ips in entry["public"].values() if ips), [])
+            print(f"      ⚠️  перехвачен/заблокирован системным DNS; "
+                  f"через публичный: {', '.join(good)}")
+        elif entry["verdict"] == "no_internet":
+            dead.append(dom)
+    if blocked:
+        warn(f"DNS-перехват затронул {len(blocked)} домен(ов): "
+             f"{', '.join(blocked)}")
+        hint("Решение: поставь DNS 77.88.8.8 / 8.8.8.8 "
+             "(Параметры сети → IPv4 → использовать следующие серверы)")
+    if dead and len(dead) == len(res):
+        err("Похоже, интернет действительно отсутствует "
+            "(не резолвятся даже через 8.8.8.8).")
+        hint("Проверь кабель/Wi-Fi, роутер и что другие сайты открываются.")
+    elif not blocked and not dead:
+        ok("DNS работает корректно — все домены резолвятся.")
+    # Проверка реальной доступности части сервисов (HTTPS)
+    for url, name in (("https://launchermeta.mojang.com/mc/game/"
+                       "version_manifest.json", "Mojang meta"),
+                      ("https://llaun.ch/jar", "llaun.ch")):
+        state_txt = "доступен" if check_reachable(url) else "НЕДОСТУПЕН"
+        print(f"  {'✅' if state_txt == 'доступен' else '⚠️ '} {name:28} {state_txt}")
+    info("Если здесь всё зелёное, а Legacy Launcher пишет «недоступные "
+         "домены» — блокируется сама Java (брандмауэр/антивирус/DPI): "
+         "разреши javaw.exe в брандмауэре Windows.")
+

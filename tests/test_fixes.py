@@ -290,6 +290,67 @@ try:
 finally:
     dl_mod.subprocess.run = _orig_run
 
+# ═══ 10. netcheck: диагностика «недоступные домены при живом интернете» ═══
+import struct as _st                                # noqa: E402
+
+# Кодирование имени в DNS-запросе (labels) и разбор ответа сcompression
+_lbls = b"".join(bytes([len(p)]) + p.encode() for p in
+                 "account.ely.by".split(".")) + b"\x00"
+check("DNS labels кодируются по RFC",
+      _lbls == b"\x07account\x03ely\x02by\x00")
+
+_hdr = _st.pack(">HHHHHH", 0xBEEF, 0x8000, 1, 1, 0, 0)
+_q = _lbls + _st.pack(">HH", 1, 1)
+_ans = b"\xc0\x0c" + _st.pack(">HHIH", 1, 1, 300, 4) + bytes([93, 184, 88, 88])
+_fake_dns = _hdr + _q + _ans
+
+
+class _FakeSock:
+    def settimeout(self, *a): pass
+    def sendto(self, *a): pass
+    def recvfrom(self, *a): return (_fake_dns, None)
+    def close(self): pass
+
+
+_real_sock = dl_mod.socket.socket
+try:
+    dl_mod.socket.socket = lambda *a, **k: _FakeSock()
+    check("_dns_query_a парсит A-запись из ответа",
+          dl_mod._dns_query_a("account.ely.by", "8.8.8.8") == ["93.184.88.88"])
+finally:
+    dl_mod.socket.socket = _real_sock
+
+# Вердикты diagnose_dns: системный DNS молчит, публичный отвечает = dns_block
+_orig_query = dl_mod._dns_query_a
+_orig_gai = dl_mod.socket.getaddrinfo
+try:
+    dl_mod.socket.getaddrinfo = lambda *a, **k: (_ for _ in ()).throw(
+        OSError("no dns"))
+    dl_mod._dns_query_a = lambda h, s, timeout=4: ["1.2.3.4"]
+    r = dl_mod.diagnose_dns(["blocked.example"])
+    check("verdict=dns_block при пустом системном DNS",
+          r["blocked.example"]["verdict"] == "dns_block")
+    dl_mod._dns_query_a = lambda h, s, timeout=4: []
+    r = dl_mod.diagnose_dns(["dead.example"])
+    check("verdict=no_internet если и публичный DNS молчит",
+          r["dead.example"]["verdict"] == "no_internet")
+    # LOPHIBUR-заглушка (127.x / 128.0.101.x) тоже считается блокировкой
+    dl_mod.socket.getaddrinfo = lambda *a, **k: [(2, 1, 0, "", ("127.0.0.1", 0))]
+    dl_mod._dns_query_a = lambda h, s, timeout=4: ["1.2.3.4"]
+    r = dl_mod.diagnose_dns(["lophi.example"])
+    check("LOPHIBUR 127.x → dns_block, а не ok",
+          r["lophi.example"]["verdict"] == "dns_block")
+finally:
+    dl_mod._dns_query_a = _orig_query
+    dl_mod.socket.getaddrinfo = _orig_gai
+
+# Команда зарегистрирована в реестре и в EXPECTED_COMMANDS
+from modules.config import EXPECTED_COMMANDS   # noqa: E402
+from modules.ui import COMMAND_REGISTRY        # noqa: E402
+check("netcheck в EXPECTED_COMMANDS", "netcheck" in EXPECTED_COMMANDS)
+check("netcheck зарегистрирован в COMMAND_REGISTRY",
+      "netcheck" in COMMAND_REGISTRY)
+
 print()
 if fails:
     print(f"ПРОВАЛОВ: {len(fails)} -> {fails}")

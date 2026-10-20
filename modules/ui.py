@@ -43,7 +43,7 @@ from modules.wine import (
 from modules.debug import rotate_old_logs
 from modules.art import print_art
 from modules.config import ARIA2C_MIRRORS, MIN_ARIA2C_SIZE, BIN_DIR
-from modules.download import try_download_manual
+from modules.download import try_download_manual, cmd_netcheck
 
 
 def _setup_readline():
@@ -142,6 +142,8 @@ def print_help():
     print(f"  {CYAN}debug{RESET}               — статус")
     print(f"  {CYAN}debug on|off{RESET}       — вкл/выкл")
     print(f"  {CYAN}debugreport{RESET}         — архив логов")
+    print(f"  {CYAN}netcheck{RESET}            — диагностика сети/DNS "
+          f"(если «недоступные домены» при живом интернете)")
     print(f"{BOLD}── Прочее ────────────────────────────────────────{RESET}")
     print(f"  {CYAN}history{RESET}, {CYAN}log{RESET}         — история / последний лог")
     print(f"  {CYAN}help{RESET}, {CYAN}?{RESET}             — эта справка")
@@ -188,6 +190,9 @@ COMMAND_REGISTRY = {
     "help": print_help, "?": print_help,
     "помощь": print_help, "справка": print_help,
     "debugreport": cmd_debugreport, "отладка": cmd_debugreport,
+    "netcheck": lambda a="": cmd_netcheck(),
+    "диагностикасети": lambda a="": cmd_netcheck(),
+    "проверкасвязи": lambda a="": cmd_netcheck(),
     "games": lambda a="": cmd_games_list(), "игры": lambda a="": cmd_games_list(),
     "minecraft": lambda a="": cmd_minecraft(), "майнкрафт": lambda a="": cmd_minecraft(),
     "fo": lambda a="": setup_fabulously_optimized(),
@@ -396,6 +401,32 @@ def process_input(name, last_exe):
     return str(chosen), True
 
 
+def _netcheck_summary():
+    """Быстрая (без HTTPS) DNS-сводка для диагностики при старте.
+
+    Различает «интернета нет» и «DNS провайдера блокирует домены лаунчера»
+    — именно этот симптом даёт окно Legacy Launcher «Список недоступных
+    доменов» при работающем интернете. Подробная проверка: команда netcheck.
+    """
+    try:
+        from modules.download import diagnose_dns, NETCHECK_DOMAINS
+        res = diagnose_dns(NETCHECK_DOMAINS[:5])
+        blocked = [d for d, r in res.items() if r["verdict"] == "dns_block"]
+        dead = [d for d, r in res.items() if r["verdict"] == "no_internet"]
+        if dead and len(dead) == len(res):
+            warn("Похоже, интернет отсутствует (домены не резолвятся "
+                 "даже через 8.8.8.8).")
+        elif blocked:
+            warn(f"DNS-блокировка: {', '.join(blocked)} — интернет есть, "
+                 f"но провайдер перехватывает эти домены.")
+            hint("Поставь DNS 77.88.8.8 / 8.8.8.8; подробности: команда "
+                 f"{CYAN}netcheck{RESET}")
+        else:
+            ok("DNS: домены лаунчера резолвятся корректно")
+    except Exception as e:
+        debug.dbg_exc(e, "_netcheck_summary")
+
+
 def print_diagnostics():
     from modules.platform_utils import IS_WINDOWS
     if IS_WINDOWS:
@@ -421,6 +452,7 @@ def print_diagnostics():
             ok(f"Java: {java_home or java_bin}")
         else:
             warn(f"Java: {java_status}")
+        _netcheck_summary()
         if state.DEBUG_MODE:
             ok(f"Дебаг: включён → {DEBUG_LOG}")
         print()
