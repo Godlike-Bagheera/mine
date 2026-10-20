@@ -144,7 +144,32 @@ class _RawSSLOpenResponse:
             pass
 
 
-def _open_raw(req, timeout, _depth=0):
+def _ssl_ctx_for(url_obj):
+    """SSL-контекст для raw-сокета.
+
+    По умолчанию строгий (системные CA). Но на Windows Python НЕ видит
+    системное хранилище сертификатов, а школьные MITM-прокси подменяют цепочку
+    своим корнем — тогда браузер «всё открывает», а любой питоновский TLS
+    падает с bad_certificate / self-signed certificate. Для таких случаев
+    есть второй, последний заход: контекст из хранилища Windows (_windows_ctx)
+    с ослабленной проверкой hostname/IP. Это ровно тот же уровень доверия,
+    что у браузера на этом компьютере; молча спускаться до CERT_NONE мы
+    отказываемся — insecure включается только явно (WI_INSECURE_SSL=1).
+    """
+    host = (url_obj.hostname or "").lower()
+    ctx = ssl.create_default_context()
+    # IP-адрес вместо имени (например, при системном DNS-перехвате llaun.ch)
+    # — сертификат почти наверняка выписан на домен, отключаем сверку адреса.
+    try:
+        import ipaddress
+        if ipaddress.ip_address(host):
+            ctx.check_hostname = False
+    except ValueError:
+        pass
+    return ctx
+
+
+def _open_raw(req, timeout, _depth=0, _ctx_stage=0):
     """Запасной путь: HTTPS-запрос через прямой ssl+http.client сокет.
 
     urllib.request прокидывает в ssl.SSLContext только ALPN (h2/h1.1) и SNI —
@@ -153,14 +178,32 @@ def _open_raw(req, timeout, _depth=0):
     третьих библиотек. Поэтому даже идентичные User-Agent и заголовки иногда
     приводят к RST от CDN, а браузер в это же время качает нормально.
     Здесь мы хотя бы убираем ALPN (только HTTP/1.1) и Connection: close —
-    иногда этого достаточно. Проверка сертификата остаётся строгой.
-    Redirect (3xx + Location) отрабатывается рекурсией (до 5 раз).
+    иногда этого достаточно. Redirect (3xx + Location) отрабатывается
+    рекурсией (до 5 раз).
+
+    Этапы TLS (_ctx_stage), чтобы отличать «сервер рвёт соединение» от
+    «нам не нравится его сертификат»:
+      0 — строгий контекст; при ошибке верификации цепочки -> 1,
+          при reset/timeout -> сразу 2 (тот же запрос ещё раз);
+      1 — контекст из хранилища Windows / certifi, check_hostname=False;
+      2 — повтор запроса (CDN-флэпы: первое RST, второе проходит).
+    CERT_NONE здесь НЕ используется (см. _insecure_fallback_allowed).
     """
     url = urllib.parse.urlsplit(req.full_url)
     if url.scheme != "https":
         raise urllib.error.URLError("raw-fallback умеет только https")
     port = url.port or 443
-    ctx = ssl.create_default_context()
+    if _ctx_stage == 1:
+        ctx = _windows_ctx()
+        if ctx is None:
+            ctx = ssl.create_default_context()
+        try:
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_REQUIRED
+        except Exception as e:
+            debug.dbg(f"_open_raw stage1 ctx: {e}", level="WARN")
+    else:
+        ctx = _ssl_ctx_for(url)
     try:
         ctx.set_alpn_protocols(["http/1.1"])
     except (NotImplementedError, AttributeError):
@@ -199,7 +242,7 @@ def _open_raw(req, timeout, _depth=0):
             for k, v in hdrs.items():
                 if k.lower() not in ("host", "connection"):
                     nreq.add_header(k, v)
-            return _open_raw(nreq, timeout, _depth + 1)
+            return _open_raw(nreq, timeout, _depth + 1, _ctx_stage)
         return _RawSSLOpenResponse(resp, ssock)
     except Exception as e:
         if conn is not None:
@@ -207,9 +250,44 @@ def _open_raw(req, timeout, _depth=0):
                 conn.close()
             except Exception:
                 pass
+        # Если TLS-рукопожатие упало на НЕверифицированном сертификате
+        # (школьный MITM / Python не видит хранилище Windows) — один раз
+        # повторяем с контекстом из системного хранилища Windows.
+        if _ctx_stage == 0 and _is_cert_error(e):
+            debug.dbg("_open_raw: cert error, пробую хранилище Windows",
+                      level="WARN")
+            return _open_raw(req, timeout, _depth, _ctx_stage=1)
+        # Reset/timeout на строгом контексте — ещё один заход (CDN-флэпы).
+        if _ctx_stage in (0, 1) and _is_resetlike(e):
+            debug.dbg(f"_open_raw: reset ({e!r}), повторяю запрос",
+                      level="WARN")
+            return _open_raw(req, timeout, _depth, _ctx_stage=2)
         reason = e if isinstance(e, OSError) else \
             urllib.error.URLError(e)
         raise reason
+
+
+def _is_cert_error(e):
+    """True, если ошибка — про верификацию цепочки сертификатов."""
+    if isinstance(e, ssl.SSLCertVerificationError):
+        return True
+    s = str(e).lower()
+    return ("certificate verify failed" in s
+            or "self signed certificate" in s
+            or "unable to get local issuer certificate" in s)
+
+
+def _is_resetlike(e):
+    """Reset/обрыв соединения (в т.ч. внутри URLError)."""
+    if isinstance(e, (ConnectionResetError, BrokenPipeError, socket.timeout,
+                      http.client.RemoteDisconnected)):
+        return True
+    r = getattr(e, "reason", None)
+    if isinstance(r, (ConnectionResetError, BrokenPipeError, socket.timeout,
+                      http.client.RemoteDisconnected)):
+        return True
+    s = str(e).lower()
+    return "10054" in s or "reset by peer" in s or "timed out" in s
 
 
 def open_checked(req, timeout):
@@ -241,6 +319,16 @@ def open_checked(req, timeout):
             raise urllib.error.URLError(e2) from e2
     except urllib.error.URLError as e:
         reason = getattr(e, "reason", None)
+        # Сброс соединения, завёрнутый urllib в URLError (на Windows это
+        # типично выглядит как WinError 10054) — тоже уводим в raw-сокет.
+        if isinstance(reason, (ConnectionResetError, BrokenPipeError,
+                               socket.timeout)) or _is_resetlike(e):
+            debug.dbg(f"open-checked reset ({e!r}), пробую raw-сокет: "
+                      f"{req.full_url}", level="WARN")
+            try:
+                return _open_raw(req, timeout)
+            except Exception as e2:
+                raise urllib.error.URLError(e2) from e2
         cert_bad = isinstance(reason, ssl.SSLCertVerificationError) or \
             "CERTIFICATE_VERIFY_FAILED" in str(reason)
         if cert_bad:
@@ -344,10 +432,12 @@ def try_download_manual(name, url, dest, silent=False):
         # HTTPError — подкласс URLError, у него есть .code; у обычного
         # URLError (DNS, reset, timeout) кода нет — берём через getattr.
         code = getattr(e, "code", None)
-        if isinstance(getattr(e, "reason", None), ConnectionResetError):
+        if isinstance(getattr(e, "reason", None), ConnectionResetError) \
+                or _is_resetlike(e):
             # open_checked уже сделал raw-попытку и она тоже упала в reset —
             # ещё один заход с тем же URL иногда проходит (CDN-флэпы).
             debug.dbg(f"reset на {name}, повторяю запрос")
+            time.sleep(1)
             try:
                 req = urllib.request.Request(url, headers=headers)
                 r = open_checked(req, CONNECT_TIMEOUT)
@@ -381,10 +471,24 @@ def try_download_manual(name, url, dest, silent=False):
                 err(f"  Не подключиться: {e}")
             return False
     except Exception as e:
-        debug.dbg_exc(e, f"connect/{name}")
-        if not silent:
-            err(f"  Не подключиться: {e}")
-        return False
+        # Сюда долетают НЕ-mock-ошибки (на Windows — OSError с WinError
+        # 10054/10061 внутри), поэтому и здесь нужен raw-фолбек, иначе
+        # «Не подключиться» печатается до всякой второй попытки.
+        if _is_resetlike(e):
+            debug.dbg(f"reset на {name} (не-URLError), пробую raw-сокет")
+            try:
+                req = urllib.request.Request(url, headers=headers)
+                r = _open_raw(_browser_headers(req), CONNECT_TIMEOUT)
+            except Exception as e2:
+                debug.dbg_exc(e2, f"connect-raw/{name}")
+                if not silent:
+                    err(f"  Не подключиться: {e2}")
+                return False
+        else:
+            debug.dbg_exc(e, f"connect/{name}")
+            if not silent:
+                err(f"  Не подключиться: {e}")
+            return False
 
     status = getattr(r, "status", 200)
     if status == 200 and existing > 0:

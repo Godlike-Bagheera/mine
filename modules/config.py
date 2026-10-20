@@ -331,13 +331,19 @@ LEGACY_MIRRORS = [
 PRISM_WIN_URLS = [
     ("GitHub (прямой)",
      "https://github.com/PrismLauncher/PrismLauncher/releases/download/"
-     "7.2/PrismLauncher-Windows-MSVC-QT6-Setup-7.2.exe"),
+     "11.1.1/PrismLauncher-Windows-MSVC-Setup-11.1.1.exe"),
     ("ghfast.top",
      "https://ghfast.top/https://github.com/PrismLauncher/PrismLauncher/releases/download/"
-     "7.2/PrismLauncher-Windows-MSVC-QT6-Setup-7.2.exe"),
+     "11.1.1/PrismLauncher-Windows-MSVC-Setup-11.1.1.exe"),
     ("ghproxy.net",
      "https://ghproxy.net/https://github.com/PrismLauncher/PrismLauncher/releases/download/"
-     "7.2/PrismLauncher-Windows-MSVC-QT6-Setup-7.2.exe"),
+     "11.1.1/PrismLauncher-Windows-MSVC-Setup-11.1.1.exe"),
+    ("gh.llkk.cc",
+     "https://gh.llkk.cc/https://github.com/PrismLauncher/PrismLauncher/releases/download/"
+     "11.1.1/PrismLauncher-Windows-MSVC-Setup-11.1.1.exe"),
+    ("gh-proxy.com",
+     "https://gh-proxy.com/https://github.com/PrismLauncher/PrismLauncher/releases/download/"
+     "11.1.1/PrismLauncher-Windows-MSVC-Setup-11.1.1.exe"),
 ]
 
 LEGACY_URL = LEGACY_MIRRORS[0][1]
@@ -345,21 +351,37 @@ LEGACY_URL = LEGACY_MIRRORS[0][1]
 # ─────────────────────────────────────────────────────────────
 # Legacy Launcher Portable (.jar) — автоскачивание.
 # ─────────────────────────────────────────────────────────────
+# llaun.ch / dl.llaun.ch отдают НАСТОЯЩИЙ portable bootstrap .jar и
+# поддерживают докачку (Range) — они в начале очереди.
 LEGACY_JAR_MIRRORS = [
-    # llaun.ch / dl.llaun.ch — официальные зеркала, отдают именно portable
-    # bootstrap .jar (PK-сигнатура, ~11 МБ) и поддерживают Range-докачку.
-    # Проверено: https://llaun.ch/jar → 200 application/octet-stream.
     ("llaun.ch (официальный)",           "https://llaun.ch/jar"),
     ("dl.llaun.ch (прямой)",             "https://dl.llaun.ch/legacy/bootstrap"),
-    # dl.legacylauncher.ru/legacy/installer отдаёт .exe-установщик (не .jar)
-    # и часто отвечает 403 на запросы без браузерных заголовков; go.legacy...
-    # — тот же CDN. Оставлены в конце как запасные.
+]
+
+# Запасные зеркала: эти URL отдают НЕ portable .jar, а .exe-установщик
+# (в config LEGACY_JAR_EXTS). В Windows-ветке legacy мы их не трогаем —
+# .exe требует Wine и известен крашем на Wine 11 (WOW64).
+LEGACY_JAR_FALLBACK_EXE = [
     ("go.legacylauncher.ru (официальный)", "https://go.legacylauncher.ru/jar"),
-    ("dl.legacylauncher.ru (официальный installer)",
+    ("dl.legacylauncher.ru (installer)",
      "https://dl.legacylauncher.ru/legacy/installer"),
     ("lln4.cc",                          "https://lln4.cc/jar"),
 ]
 LEGACY_JAR_MIN_SIZE = 1 * 1024 * 1024   # реальный .jar ~ 2-5 МБ
+
+
+def legacy_jar_mirrors(is_windows):
+    """Очередь зеркал portable-лаунчера для download_file.
+
+    На Windows — только jar-зеркала + api-домен в конце (стабильно падает по
+    DNS, но пусть будет последним, а не первым). Раньше очередь начиналась с
+    мёртвых/блокируемых зеркал и до живых llaun.ch дело не доходило.
+    """
+    out = list(LEGACY_JAR_MIRRORS)
+    if not is_windows:
+        out += list(LEGACY_JAR_FALLBACK_EXE)
+    out.append(("api.legacylauncher.net", LEGACY_JAR_URL_API))
+    return out
 
 # ─────────────────────────────────────────────────────────────
 # Wine Mono — НЕ используется (Wine сам предлагает установку).

@@ -15,7 +15,7 @@ from modules.config import (
     WINE_DIR, PRISM_DIR, PRISM_URL, WINE_PREFIX,
     FO_GITHUB_API, OPTIFINE_PAGE, FABRIC_META, FABRIC_MAVEN,
     MOJANG_VERSION_MANIFEST, make_github_mirrors,
-    LEGACY_JAR_MIRRORS, LEGACY_JAR_MIN_SIZE,
+    LEGACY_JAR_MIN_SIZE, legacy_jar_mirrors,
     SYSTEM_TRUSTSTORE_PATHS, SYSTEM_TRUSTSTORE_PASSWORD,
     FABRIC_META_API, MAVEN_FABRIC, MAVEN_CENTRAL,
     OFPS_MODRINTH_API, LUXIUM_MC_SIDE, CF_EDGE_BASES, REPO_ROOT,
@@ -27,7 +27,7 @@ from modules.config import (
     SODIUM_VERSIONS_API, SODIUM_PINNED_VERSION, SODIUM_MC_VERSION,
     luxium_supports_fabric, luxium_fabric_dep,
 
-    LEGACY_JAR_URL_API, LEGACY_MANUAL_PAGE, LEGACY_MANUAL_JAR_URL,)
+    LEGACY_MANUAL_PAGE, LEGACY_MANUAL_JAR_URL,)
 from modules import net
 from modules.download import download_file
 from modules.hash_utils import verify_sha512, verify_sha1, copy_to_clipboard
@@ -336,16 +336,28 @@ def _find_legacy_installed():
 
 
 def _find_local_legacy_jar():
-    """Ищет уже скачанный .jar в стандартных местах."""
+    """Ищет уже скачанный .jar в стандартных местах + в Downloads."""
     candidates = [
         WINE_DIR / "legacy-portable" / "LegacyLauncher.jar",
         WINE_DIR / "LegacyLauncher.jar",
         WINE_DIR / "legacy-portable" / "bootstrap.jar",
         WINE_DIR / "bootstrap.jar",
     ]
+    # Пользователь мог скачать portable-джар браузером в папку Downloads —
+    # ищем там по имению, чтобы не заставлять качать то же самое повторно.
+    for pattern in ("*egacy*auncher*.jar", "bootstrap*.jar", "launcher*.jar"):
+        try:
+            candidates += sorted(Path.home().glob(f"Downloads/{pattern}"),
+                                 key=lambda p: p.stat().st_size, reverse=True)
+        except Exception as e:
+            debug.dbg(f"_find_local_legacy_jar glob {pattern}: {e}",
+                      level="WARN")
     for p in candidates:
-        if p.exists() and p.stat().st_size > LEGACY_JAR_MIN_SIZE:
-            return p
+        try:
+            if p.exists() and p.is_file() and p.stat().st_size > LEGACY_JAR_MIN_SIZE:
+                return p
+        except OSError:
+            continue
     return None
 
 
@@ -392,10 +404,8 @@ def setup_legacy_portable():
         #    браузерных заголовков («в браузере открывается» ≠ «urlopen
         #    работает»: у urllib другой TLS-фингерпринт и UA).
         info("Скачиваю Legacy Launcher Portable...")
-        # api.legacylauncher.net в конце: домен стабильно не резолвится
-        # (getaddrinfo failed) и только тратит очередь зеркал.
-        mirrors = list(LEGACY_JAR_MIRRORS) + \
-            [("api.legacylauncher.net", LEGACY_JAR_URL_API)]
+        from modules.platform_utils import IS_WINDOWS as _IS_WIN
+        mirrors = legacy_jar_mirrors(_IS_WIN)
         downloaded = download_file(
             mirrors, jar_path,
             "Legacy Launcher Portable",
