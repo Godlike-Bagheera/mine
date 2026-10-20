@@ -11,12 +11,12 @@ import modules.platform_utils as pu
 assert pu.IS_WINDOWS is True, "IS_WINDOWS should be True"
 # entry point
 try:
-    import wine  # noqa: F401
+    import launcher  # noqa: F401
 except SystemExit as e:
     print("SystemExit:", e.code)
     sys.exit(0)
 from modules.ui import main as ui_main
-sys.argv = ['wine.py']
+sys.argv = ["launcher.py"]
 try:
     ui_main()
 except SystemExit as e:

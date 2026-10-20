@@ -146,7 +146,17 @@ def cmd_debugreport():
 # ═══════════════════════════════════════════════════════════════════
 
 
+def _win_no_wine(what: str):
+    """Единый ответ для Wine-only команд на Windows."""
+    warn(f"Команда «{what}» нужна только на Linux/РЕД ОС (для запуска .exe через Wine).")
+    hint("На Windows 10 всё работает нативно — Wine не используется.")
+
+
 def cmd_reset():
+    from modules.platform_utils import IS_WINDOWS
+    if IS_WINDOWS:
+        _win_no_wine("reset")
+        return
     if not WINE_PREFIX.exists():
         warn("Префикс отсутствует.")
         return
@@ -171,6 +181,10 @@ def cmd_reset():
 
 
 def cmd_vulkan():
+    from modules.platform_utils import IS_WINDOWS
+    if IS_WINDOWS:
+        _win_no_wine("vulkan")
+        return
     try:
         r = subprocess.run(["vulkaninfo", "--summary"], capture_output=True, text=True, timeout=10)
         if r.returncode == 0:
@@ -184,6 +198,34 @@ def cmd_vulkan():
 
 
 def cmd_verify():
+    from modules.platform_utils import IS_WINDOWS
+    if IS_WINDOWS:
+        # Wine/DXVK/префикс на Windows не используются — проверяем только то,
+        # что реально нужно для нативного пути: Java и игровые папки.
+        info(f"{BOLD}Проверка окружения (Windows, без Wine)...{RESET}")
+        problems = 0
+        java_bin, java_home, java_status = find_java()
+        if java_home or java_bin:
+            ok(f"Java: {java_home or java_bin}")
+        else:
+            warn(f"Java: {java_status}")
+            hint("Установи: install-java")
+            problems += 1
+        mc_dirs = []
+        try:
+            from modules.prefix import find_minecraft_dirs
+            mc_dirs = find_minecraft_dirs(limit=5)
+        except Exception as e:
+            debug.dbg_exc(e, "cmd_verify/win_mcdirs")
+        if mc_dirs:
+            for d in mc_dirs[:3]:
+                ok(f"Игровая папка: {d}")
+        else:
+            hint("Игровых папок пока нет — начни с команды `legacy` или `prism`")
+        print()
+        if problems == 0:
+            ok("Всё в порядке")
+        return
     info(f"{BOLD}Проверка целостности...{RESET}")
     problems = 0
     if WINE_BIN.exists() and os.access(WINE_BIN, os.X_OK):
@@ -276,6 +318,12 @@ def cmd_log():
 
 
 def cmd_steamfix(name):
+    from modules.platform_utils import IS_WINDOWS
+    if IS_WINDOWS:
+        _win_no_wine("steamfix")
+        hint("На Windows Goldberg-заглушки кладутся рядом с .exe игры вручную — "
+             "Wine-префикс для этого не нужен.")
+        return
     info(f"Ищу '{name}'...")
     found_any = False
     for candidate in [WINE_PREFIX / "drive_c" / "windows" / "system32",

@@ -1,7 +1,7 @@
 @echo off
 REM ============================================================
 REM  MC Installer for Windows 10 - bootstrap (cmd.exe)
-REM  Скачивает репозиторий Godlike-Bagheera\mine и запускает wine.py
+REM  Скачивает репозиторий Godlike-Bagheera\mine и запускает launcher.py
 REM  Использование:  install.cmd            (обычный запуск)
 REM                  install.cmd --debug    (подробный лог)
 REM ============================================================
@@ -57,7 +57,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "Expand-Archive -Force '%TEMP%\mcinst\main.zip' '%TEMP%\mcinst\ext';" ^
   "if (Test-Path '%DEST%') { Remove-Item -Recurse -Force '%DEST%' };" ^
   "Move-Item '%TEMP%\mcinst\ext\mine-main' '%DEST%'"
-if not exist "%DEST%\wine.py" (
+if not exist "%DEST%\launcher.py" (
     echo  [X] Загрузка не удалась. Скачай архив вручную:
     echo      %ZIP_URL%
     pause
@@ -65,13 +65,13 @@ if not exist "%DEST%\wine.py" (
 )
 
 :run
-if not exist "%DEST%\wine.py" (
-    echo  [X] wine.py не найден в %DEST%
+if not exist "%DEST%\launcher.py" (
+    echo  [X] launcher.py не найден в %DEST%
     pause
     exit /b 1
 )
 echo  [OK] Запускаю установщик...
 echo.
-%PY% "%DEST%\wine.py" %*
+%PY% "%DEST%\launcher.py" %**
 if errorlevel 1 pause
 endlocal

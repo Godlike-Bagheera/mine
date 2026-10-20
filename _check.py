@@ -15,8 +15,8 @@ for m in mods:
 print("MODULE FAILS:", bad if bad else "none")
 
 try:
-    import wine  # noqa: F401
-    print("entry wine.py OK")
+    import launcher  # noqa: F401
+    print("entry launcher.py OK")
 except SystemExit as e:
     print("entry SystemExit code:", e.code)
 except BaseException as e:

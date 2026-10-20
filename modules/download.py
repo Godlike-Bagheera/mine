@@ -328,6 +328,41 @@ def open_system_proxy(req, timeout):
         return None
 
 
+CURL_BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/124.0.0.0 Safari/537.36")
+
+
+def _run_curl(exe, url, tmp, timeout, extra=None):
+    """Один запуск curl.exe -> tmp. Возвращает (True|False, текст_ошибки)."""
+    cmd = [exe, "--fail", "--location-trusted", "--http1.1",
+           "--retry", "2", "--retry-delay", "1",
+           "--connect-timeout", str(timeout // 4 or 15),
+           "--max-time", str(timeout),
+           "--user-agent", CURL_BROWSER_UA,
+           "--output", str(tmp)]
+    if extra:
+        cmd += list(extra)
+    cmd.append(url)
+    debug.dbg(f"curl: {' '.join(cmd)}")
+    try:
+        r = subprocess.run(cmd, check=False, timeout=timeout + 90,
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.PIPE)
+        if r.returncode == 0 and tmp.exists() and tmp.stat().st_size > 0:
+            return True, ""
+        errtxt = ""
+        try:
+            lines = (r.stderr or b"").decode("utf-8", errors="ignore") \
+                .strip().splitlines()
+            errtxt = lines[-1] if lines else ""
+        except Exception:
+            pass
+        return False, f"rc={r.returncode}: {errtxt}"
+    except Exception as e:
+        return False, str(e)
+
+
 def download_via_curl(url, dest, timeout=CONNECT_TIMEOUT * 4):
     """Запасная закачка системной утилитой curl (есть в Windows 10 1803+).
 
@@ -335,47 +370,128 @@ def download_via_curl(url, dest, timeout=CONNECT_TIMEOUT * 4):
     он настроен, системный прокси, поэтому проходит там, где питоновский
     ssl падает (MITM-корень школы, RST на TLS-фингерпринт Python).
     True — файл скачан (размер проверяет вызывающий код).
+
+    Варианты запуска (первый же успех прерывает цикл):
+      1) как есть — curl сам подхватит системный прокси из реестра;
+      2) --noproxy "*" — если корпоративный прокси мешает прямой закачке;
+      3) insecure — только при WI_INSECURE_SSL=1 (школа с MITM-сертификатом);
+      4) wget.exe — если вдруг curl отсутствует, но есть wget в PATH.
     """
     exe = shutil_which_curl()
     if not exe:
-        return False
+        return _download_via_wget(url, dest, timeout)
     tmp = Path(str(dest) + ".curlpart")
-    # --retry: CDN-редиректы GitHub и зеркала часто отдают разовый сбой;
-    # без повторов curl падал молча, и весь фолбек считался неудачным.
-    # --http1.1: HTTP/2 у Schannel/curl на Windows в некоторых сетях даёт
-    # ошибки рукопожатия там, где HTTP/1.1 проходит.
-    cmd = [exe, "--fail", "--location", "--http1.1",
-           "--retry", "2", "--retry-delay", "1",
-           "--connect-timeout", str(timeout // 4 or 15),
-           "--max-time", str(timeout),
-           "--user-agent", ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                            "AppleWebKit/537.36 (KHTML, like Gecko) "
-                            "Chrome/124.0.0.0 Safari/537.36"),
-           "--output", str(tmp), url]
-    debug.dbg(f"curl fallback: {' '.join(cmd)}")
-    try:
-        r = subprocess.run(cmd, check=False, timeout=timeout + 90,
-                           stdout=subprocess.DEVNULL,
-                           stderr=subprocess.PIPE)
-        if r.returncode == 0 and tmp.exists() and tmp.stat().st_size > 0:
+    attempts = [[], ["--noproxy", "*"]]
+    if _insecure_fallback_allowed():
+        attempts.append(["--insecure"])
+        warn("curl: нестрогая проверка сертификатов "
+             "(WI_INSECURE_SSL=1 включён пользователем)")
+    last_err = ""
+    for extra in attempts:
+        ok_, errtxt = _run_curl(exe, url, tmp, timeout, extra)
+        if ok_:
             os.replace(tmp, dest)
             return True
-        errtxt = ""
-        try:
-            errtxt = (r.stderr or b"").decode("utf-8", errors="ignore") \
-                .strip().splitlines()[-1:] or [""]
-            errtxt = errtxt[0] if errtxt else ""
-        except Exception:
-            pass
-        debug.dbg(f"curl rc={r.returncode}: {errtxt}", level="WARN")
-    except Exception as e:
-        debug.dbg(f"curl fallback failed: {e}", level="WARN")
+        last_err = errtxt
+        debug.dbg(f"curl attempt failed ({extra}): {errtxt}", level="WARN")
+    if last_err:
+        info(f"  curl не смог: {last_err[:120]}")
     try:
         if tmp.exists():
             tmp.unlink()
     except Exception:
         pass
     return False
+
+
+def _download_via_wget(url, dest, timeout):
+    """Последний внешний инструмент: wget.exe (если стоит в PATH)."""
+    import shutil as _sh
+    exe = _sh.which("wget") or _sh.which("wget.exe")
+    if not exe:
+        return False
+    tmp = Path(str(dest) + ".wgetpart")
+    cmd = [exe, "-q", "--tries=2", "--timeout=20",
+           "--user-agent=" + CURL_BROWSER_UA,
+           "-O", str(tmp), url]
+    try:
+        r = subprocess.run(cmd, check=False, timeout=timeout + 90)
+        if r.returncode == 0 and tmp.exists() and tmp.stat().st_size > 0:
+            os.replace(tmp, dest)
+            ok(f"  Готово (wget): {dest.stat().st_size / 1024 / 1024:.1f} МБ")
+            return True
+    except Exception as e:
+        debug.dbg(f"wget failed: {e}", level="WARN")
+    try:
+        if tmp.exists():
+            tmp.unlink()
+    except Exception:
+        pass
+    return False
+
+
+def _curl_head_ok(exe, url, timeout=20):
+    """Быстрая HEAD-проверка живости зеркала через curl (-I). True/False."""
+    cmd = [exe, "-I", "-s", "-o", os.devnull, "--http1.1",
+           "--connect-timeout", str(max(timeout // 3, 8)),
+           "--max-time", str(timeout),
+           "--user-agent", CURL_BROWSER_UA, url]
+    try:
+        r = subprocess.run(cmd, check=False, timeout=timeout + 15,
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
+        # rc==0 => HTTP < 400 (curl -I считает 4xx/5xx ошибкой только с --fail;
+        # без --fail rc=0 даже для 404, поэтому проверяем вывод заголовков)
+        if r.returncode != 0:
+            return False
+        # без --fail код ответа надо смотреть в заголовках — делаем второй
+        # проход с --write-out (дёшево, HEAD уже прогрел соединение)
+        cmd2 = [exe, "-I", "-s", "--http1.1",
+                "--connect-timeout", str(max(timeout // 3, 8)),
+                "--max-time", str(timeout),
+                "--user-agent", CURL_BROWSER_UA,
+                "--write-out", "%{http_code}", "--output", os.devnull, url]
+        r2 = subprocess.run(cmd2, check=False, timeout=timeout + 15,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL)
+        code = (r2.stdout or b"").decode(errors="ignore").strip()
+        return code.isdigit() and int(code) < 400
+    except Exception as e:
+        debug.dbg(f"curl -I {url}: {e}", level="WARN")
+        return False
+
+
+def probe_mirrors_with_curl(mirrors, budget_sec=25):
+    """Проверяет живость зеркал быстрым curl -I и возвращает новый список.
+
+    Смысл: на Windows curl — основной путь закачки, но раньше он слепо шёл
+    по порядку очереди. Если первое зеркало зависает/постоянно RST'ится,
+    пользователь наблюдал вечное «Пробую закачку через curl.exe: ...» вместо
+    рабочего второго зеркала. Здесь каждое зеркало проверяется коротким
+    HEAD-запросом (общий бюджет ~budget_sec секунд); живые ставятся в начало
+    в исходном порядке, мёртвые — в конец. Ошибки проверки НЕ удаляют
+    зеркало (пробовали же HEAD, а GET работает иначе) — просто отодвигают.
+    """
+    from modules.platform_utils import IS_WINDOWS as _IS_WIN
+    if not _IS_WIN or len(mirrors) <= 1:
+        return list(mirrors)
+    exe = shutil_which_curl()
+    if not exe:
+        return list(mirrors)
+    alive, dead = [], []
+    deadline = time.time() + budget_sec
+    for item in mirrors:
+        name, url = item[0], item[1]
+        if time.time() >= deadline:
+            dead.append(item)   # бюджет истёк — остаток в конец очереди
+            continue
+        per = max(int(deadline - time.time()), 5)
+        if _curl_head_ok(exe, url, timeout=min(15, per)):
+            alive.append(item)
+        else:
+            debug.dbg(f"probe: {name} недоступен/медлит — отодвигаю")
+            dead.append(item)
+    return alive + dead
 
 
 def download_queue_with_curl(mirrors, dest, min_bytes=1024, silent=False):
@@ -387,9 +503,14 @@ def download_queue_with_curl(mirrors, dest, min_bytes=1024, silent=False):
     файл реально скачан (размер >= min_bytes), либо None. Используется как
     ПЕРВЫЙ путь на Windows: питоновские попытки при RST-блокировке только
     жгут время и выводят пользователя из себя длинными списками ошибок.
+
+    Перед прогоном очередь переупорядочивается быстрым HEAD-пробом
+    (probe_mirrors_with_curl), чтобы зависшее зеркало не блокировалось
+    долгими таймаутами раньше живого.
     """
     if not shutil_which_curl():
         return None
+    mirrors = probe_mirrors_with_curl(mirrors)
     for name, url in mirrors:
         try:
             if dest.exists() and dest.stat().st_size >= max(min_bytes, 1024):

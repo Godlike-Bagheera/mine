@@ -433,6 +433,83 @@ def _launch_prism_exe(exe):
         return False
 
 
+def _prism_search_roots():
+    """Папки, где реально может лежать prismlauncher.exe.
+
+    Кроме нашей portable-папки (PRISM_DIR) это типичные места ручной
+    установки: Program Files, LOCALAPPDATA\\Programs, Downloads и сама
+    mc-portable (пользователь мог распаковать архив в стороне). Игнорируем
+    заведомо чужие/огромные деревья. Нужен для диагностики icu.DLL: понять,
+    ЗАПУСКАЕТСЯ ли битый exe из Setup-установки или у portable просто нет dll.
+    """
+    roots = []
+    envs = [os.environ.get("ProgramFiles"),
+            os.environ.get("ProgramFiles(x86)"),
+            os.environ.get("LOCALAPPDATA")]
+    for e in envs:
+        if e:
+            roots.append(Path(e))
+            roots.append(Path(e) / "Programs")
+    dl = Path.home() / "Downloads"
+    roots.append(dl)
+    roots.append(WINE_DIR)
+    return [r for r in roots if r and r.is_dir()]
+
+
+def _find_all_prism_exes(limit=40):
+    """Все prismlauncher.exe в типичных местах (для диагностики)."""
+    found = []
+    for base in _prism_search_roots():
+        try:
+            for p in base.rglob("prismlauncher.exe"):
+                try:
+                    if p.is_file():
+                        found.append(p)
+                except OSError:
+                    continue
+                if len(found) >= limit:
+                    return found
+        except Exception as e:
+            debug.dbg(f"_find_all_prism_exes {base}: {e}", level="WARN")
+    return found
+
+
+def _diagnose_icu_error():
+    """После сообщения Windows «не обнаружена icu.DLL» — найти виновника.
+
+    1) Если где-то лежит prismlauncher.exe БЕЗ icu*.dll рядом — это он и есть
+       (обычно старая Setup-версия в Program Files). Показываем путь,
+       предлагаем удалить и копируем его в буфер (легко открыть папку).
+    2) Если все найденные exe «здоровые», но ошибка всё равно вылезла —
+       значит запускался не тот файл: подсказываем запускать exe строго из
+       папки с dll.
+    """
+    bad, good = [], []
+    for p in _find_all_prism_exes():
+        (good if _prism_has_icu(p) else bad).append(p)
+    if bad:
+        err("Найден prismlauncher.exe БЕЗ icu*.dll — именно он падает:")
+        for p in bad[:5]:
+            print(f"    {YELLOW}{p}{RESET}")
+        hint("Удали эту папку целиком (или перенеси portable-версию):")
+        hint(f"    {PRISM_DIR}")
+        try:
+            if copy_to_clipboard(str(bad[0].parent)):
+                ok("Путь к битой установке скопирован в буфер обмена "
+                   "(вставь в проводник и удали папку)")
+        except Exception as e:
+            debug.dbg(f"clipboard: {e}", level="WARN")
+    elif good:
+        hint("Битых установок не найдено; рабочая(ие) portable-копии:")
+        for p in good[:3]:
+            print(f"    {MAGENTA}{p}{RESET}")
+        hint("Запускай именно этот .exe двойным кликом ИЗ ЕГО ПАПКИ "
+             "(DLL должны лежать рядом с ним).")
+    else:
+        hint("Ни одной копии Prism на диске не найдено — нужна установка "
+             "(эта команда её и делает).")
+
+
 def setup_prism():
     from modules.platform_utils import IS_WINDOWS
     info(f"{BOLD}Установка Prism Launcher{RESET}")
@@ -449,8 +526,14 @@ def setup_prism():
             prev_exe = None
         if prev_exe and _prism_has_icu(prev_exe):
             ok(f"Prism уже установлен (portable): {prev_exe}")
-            _launch_prism_exe(prev_exe)
+            launched = _launch_prism_exe(prev_exe)
+            if not launched:
+                _diagnose_icu_error()
             return True
+        if prev_exe and not _prism_has_icu(prev_exe):
+            warn("Распакованный Prism повреждён: рядом с prismlauncher.exe "
+                 "нет icu*.dll (тот самый запуск даёт «система не обнаружила "
+                 "icu.DLL»). Перекачаю Portable-архив заново.")
 
     if IS_WINDOWS:
         # На Windows .tar.gz с Linux-бинарником бесполезен — качаем
@@ -523,6 +606,18 @@ def setup_prism():
                 except OSError as e:
                     debug.dbg_exc(e, "setup_prism/copy-download")
 
+        # 4) Если в prism/ уже распакованы файлы из настоящего Portable-архива
+        # (prismlauncher.exe + icu*.dll), но сам zip потерян/бит — сеть больше
+        # НЕ нужна: просто запускаем то, что лежит на диске. Это лечит случай
+        # «ошибка icu.DLL остаётся», когда пользователь качал архив браузером
+        # и распаковывал его сюда вручную.
+        if archive is None:
+            ex = _find_prism_exe()
+            if ex and _prism_has_icu(ex):
+                ok("Prism уже распакован в папке — запускаю без закачки")
+                _launch_prism_exe(ex)
+                return True
+
         if archive is None and not download_file(PRISM_WIN_URLS, dest,
                                                  "Prism Launcher (Windows)",
                                                  min_size_mb=10,
@@ -545,6 +640,7 @@ def setup_prism():
                     ok(f"Открыл в браузере: {PRISM_WIN_OFFICIAL_PAGE}")
             except Exception as e:
                 debug.dbg_exc(e, "setup_prism/win-browser")
+            _diagnose_icu_error()
             return False
         archive = dest
         if not _prism_zip_ok(archive):
@@ -554,6 +650,7 @@ def setup_prism():
                 archive.unlink()
             except OSError as e:
                 debug.dbg_exc(e, "setup_prism/unlink-bad")
+            _diagnose_icu_error()
             return False
         try:
             net.safe_extract_zip(archive, PRISM_DIR)
@@ -710,6 +807,59 @@ def _open_legacy_manual_page():
     return False
 
 
+def _run_legacy_jar(jar_path):
+    """Запуск portable .jar через найденную Java (без Wine).
+
+    На Windows — detached-запуск (javaw), терминал не блокируется.
+    Возвращает True, если процесс реально стартовал; иначе понятное
+    сообщение и False (пользователь сможет запустить jar двойным кликом).
+    """
+    from modules.platform_utils import IS_WINDOWS as _IS_WIN
+    java_bin, java_home, java_status = find_java()
+    if not java_bin:
+        err("Java не найдена — портативный .jar требует Java.")
+        hint("Windows: winget install Microsoft.OpenJDK.17  "
+             "или команда `install-java` (портативная JDK 17)")
+        return False
+    hint(f"Запускаю Legacy Launcher ({Path(jar_path).name})...")
+    try:
+        env = dict(os.environ)
+        truststore = None
+        try:
+            truststore = _find_system_truststore()
+        except Exception as e:
+            debug.dbg(f"truststore: {e}", level="WARN")
+        if truststore and not _IS_WIN:
+            # Red OS/OpenJDK: русские CA в системном truststore, но не в
+            # cacerts JVM — внутренний http-клиент лаунчера падает по SSL.
+            opts = env.get("JAVA_TOOL_OPTIONS", "")
+            env["JAVA_TOOL_OPTIONS"] = (
+                (opts + " " if opts else "")
+                + f"-Djavax.net.ssl.trustStore={truststore} "
+                  "-Djavax.net.ssl.trustStorePassword="
+                + SYSTEM_TRUSTSTORE_PASSWORD)
+        exe = java_bin
+        if _IS_WIN:
+            # javaw.exe — окно лаунчера без чёрной консоли; если рядом его
+            # нет (например, JRE без bin\javaw), запускаем как есть.
+            cand = Path(java_bin).with_name("javaw.exe")
+            if cand.is_file():
+                exe = str(cand)
+            subprocess.Popen([exe, "-jar", str(jar_path)], env=env,
+                             cwd=str(Path(jar_path).parent))
+            ok("Legacy Launcher запущен (окно откроется отдельно)")
+        else:
+            subprocess.Popen([exe, "-jar", str(jar_path)], env=env,
+                             cwd=str(Path(jar_path).parent))
+            ok("Legacy Launcher запущен")
+        return True
+    except Exception as e:
+        debug.dbg_exc(e, "_run_legacy_jar")
+        err(f"Не удалось запустить jar: {e}")
+        hint(f"Можно вручную: \"{java_bin}\" -jar \"{jar_path}\"")
+        return False
+
+
 def setup_legacy_portable():
     """Скачивает Legacy Launcher Portable .jar (если нужно) и запускает через Java.
 
@@ -803,14 +953,38 @@ def setup_legacy_portable():
                         "похоже, это не лаунчер")
                     return False
                 if jar_path.suffix.lower() == ".exe":
-                    err("Это .exe-установщик — он требует Wine и известен крашем.")
-                    hint("Нужен PORTABLE .jar (bootstrap.jar / LegacyLauncher.jar)")
-                    hint(f"Скачать: {LEGACY_MANUAL_JAR_URL}")
-                    return False
+                    # Раньше такой файл просто отвергался. Но официальный
+                    # .exe-установщик Legacy Launcher — нормальный Windows-
+                    # установщик (крашится он только в Wine на Linux). Если
+                    # portable .jar скачать нельзя, пусть ставит его сам:
+                    # запускаем и выходим с понятной инструкцией.
+                    warn("Это .exe-установщик (не portable .jar).")
+                    hint("На Windows он работает нормально — запускаю...")
+                    try:
+                        subprocess.Popen([str(jar_path)],
+                                         cwd=str(jar_path.parent))
+                        ok("Установщик запущен: установи лаунчер, затем "
+                           "запусти его из меню «Пуск».")
+                        return True
+                    except Exception as e:
+                        debug.dbg_exc(e, "setup_legacy/run-exe-installer")
+                        err(f"Не удалось запустить установщик: {e}")
+                        hint("Запусти файл двойным кликом вручную.")
+                        return False
                 if jar_path.suffix.lower() != ".jar":
                     warn(f"Неожиданное расширение: {jar_path.suffix} — пробую запустить как .jar")
 
-    # 4. Java
+    # 4. Windows: запуск detached (javaw) — терминал не блокируется, а
+    # bootstrap-джар при сетевом сбое умеет зависать/падать с кодом 1; в
+    # окне консоли это выглядит как «всё сломалось». На Linux оставляем
+    # прежний синхронный запуск с ретраями (там доверие к CA Минцифры
+    # требует JAVA_TOOL_OPTIONS и вывода кода возврата).
+    from modules.platform_utils import IS_WINDOWS as _IS_WIN
+    if _IS_WIN:
+        print()
+        return _run_legacy_jar(jar_path)
+
+    # 5. Java
     java_bin, java_home, java_status = find_java()
     if not java_bin:
         err("Java не найдена. Portable .jar требует Java.")
@@ -918,8 +1092,12 @@ def setup_legacy():
             ok(f"Legacy Launcher уже установлен: {found}")
             return True
 
-    warn("Wine-установщик Legacy Launcher известен крашем на Wine 11 (WOW64)")
-    info("Использую Portable (.jar) — работает без Wine")
+    if _IS_WIN:
+        # На Windows Wine нет и не нужен — сразу portable .jar на чистой Java.
+        info("Portable (.jar) — нативный запуск через Java, Wine не используется")
+    else:
+        warn("Wine-установщик Legacy Launcher известен крашем на Wine 11 (WOW64)")
+        info("Использую Portable (.jar) — работает без Wine")
     print()
 
     # Windows: если в сети RST-блокировка Python-TLS, питоновские попытки

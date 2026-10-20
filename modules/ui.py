@@ -81,9 +81,10 @@ def _setup_readline():
     except Exception as e:
         debug.dbg_exc(e, "ui")
 def print_help():
+    from modules.platform_utils import IS_WINDOWS
     # Динамическая рамка: ширина считается от содержимого, не «едет» при v2.10+
     title = f"  Команды v{CURRENT_VERSION}"
-    width = max(len(title), len("  Wine Installer + Game Launcher")) + 2
+    width = max(len(title), len("  MC Installer + Game Launcher")) + 2
     border = "═" * width
     print(f"{BOLD}╔{border}╗")
     print(f"║{title.ljust(width)}║")
@@ -110,20 +111,29 @@ def print_help():
     print(f"  {CYAN}shaders{RESET}              — установить шейдер-пак (shaderpacks)")
     print(f"  {CYAN}shaders <URL>{RESET}       — пак по прямой ссылке (.zip)")
     print(f"  {CYAN}install-java{RESET}         — портативная JDK 17")
-    print(f"{BOLD}── Миры (Диск D, RED OS) ─────────────────────────{RESET}")
-    print(f"  {CYAN}worlds{RESET}              — меню миров (диск D)")
-    print(f"  {CYAN}saveworlds{RESET}          — сохранить миры на Диск D")
-    print(f"  {CYAN}loadworlds{RESET}          — загрузить миры с Диска D")
+    if IS_WINDOWS:
+        print(f"{BOLD}── Миры ──────────────────────────────────────────{RESET}")
+    else:
+        print(f"{BOLD}── Миры (Диск D, RED OS) ─────────────────────────{RESET}")
+    print(f"  {CYAN}worlds{RESET}              — меню миров")
+    print(f"  {CYAN}saveworlds{RESET}          — сохранить миры")
+    print(f"  {CYAN}loadworlds{RESET}          — загрузить миры")
     print(f"{BOLD}── Утилиты ───────────────────────────────────────{RESET}")
-    print(f"  {CYAN}fonts{RESET}               — corefonts")
     print(f"  {CYAN}steamfix <имя.exe>{RESET} — заглушка steam_api.dll")
-    print(f"  {CYAN}gamemode{RESET}            — GameMode вкл/выкл")
-    print(f"  {CYAN}vulkan{RESET}              — проверка Vulkan")
     print(f"  {CYAN}verify{RESET}              — целостность")
-    print(f"  {CYAN}update{RESET}              — переустановить Wine/DXVK")
-    print(f"  {CYAN}dxvk{RESET}                — только DXVK")
-    print(f"  {CYAN}reset{RESET}               — удалить префикс")
-    print(f"  {CYAN}bin{RESET}                 — содержимое bin/")
+    print(f"  {CYAN}update{RESET}              — обновить скрипт из GitHub")
+    if IS_WINDOWS:
+        # Wine/DXVK/winetricks/GameMode/vulkaninfo — это Linux-путь (РЕД ОС).
+        # На Windows всё нативное: эти команды скрыты из справки, но если
+        # ввести их случайно — получат понятное сообщение, а не краш.
+        pass
+    else:
+        print(f"  {CYAN}fonts{RESET}               — corefonts (Wine)")
+        print(f"  {CYAN}gamemode{RESET}            — GameMode вкл/выкл")
+        print(f"  {CYAN}vulkan{RESET}              — проверка Vulkan")
+        print(f"  {CYAN}dxvk{RESET}                — только DXVK")
+        print(f"  {CYAN}reset{RESET}               — удалить Wine-префикс")
+        print(f"  {CYAN}bin{RESET}                 — содержимое bin/")
     print(f"{BOLD}── Настройки ─────────────────────────────────────{RESET}")
     print(f"  {CYAN}settings{RESET}            — показать")
     print(f"  {CYAN}settings quiet|gamemode|debug on|off{RESET}")
@@ -225,6 +235,11 @@ COMMAND_REGISTRY = {
 
 
 def _cmd_dxvk():
+    from modules.platform_utils import IS_WINDOWS
+    if IS_WINDOWS:
+        from modules.commands import _win_no_wine
+        _win_no_wine("dxvk")
+        return
     from modules.wine import cmd_dxvk
     cmd_dxvk()
 
