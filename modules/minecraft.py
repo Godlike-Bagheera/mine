@@ -1111,12 +1111,33 @@ def setup_legacy():
         cand = jar_dir / "LegacyLauncher.jar"
         exe_cand = jar_dir / "LegacyLauncher-setup.exe"
 
-        def _exe_cached_ok():
+        def _exe_size_ok(p):
             try:
-                return (exe_cand.exists()
-                        and exe_cand.stat().st_size > 2 * 1024 * 1024)
+                return p.exists() and p.stat().st_size > 2 * 1024 * 1024
             except OSError:
                 return False
+
+        def _exe_cached_ok():
+            # Плюс «Legacy Launcher Setup.exe» — имя, под которым браузер
+            # сохраняет официальный установщик; раньше кэш по нему не
+            # находился и 117 МБ качались заново.
+            from modules.config import LEGACY_EXE_CACHE_NAMES
+            if _exe_size_ok(exe_cand):
+                return True
+            for nm in LEGACY_EXE_CACHE_NAMES[1:]:
+                if _exe_size_ok(jar_dir / nm):
+                    return True
+            return False
+
+        def _exe_cached_path():
+            """Куда реально лёг установщик (наше имя или имя браузера)."""
+            from modules.config import LEGACY_EXE_CACHE_NAMES
+            if _exe_size_ok(exe_cand):
+                return exe_cand
+            for nm in LEGACY_EXE_CACHE_NAMES[1:]:
+                if _exe_size_ok(jar_dir / nm):
+                    return jar_dir / nm
+            return None
 
         if not (cand.exists() and cand.stat().st_size >= LEGACY_JAR_MIN_SIZE
                 and _looks_like_jar(cand)) \
@@ -1149,9 +1170,10 @@ def setup_legacy():
         # Если есть скачанный .exe-установщик — запускаем его сразу,
         # portable .jar больше не нужен (установщик сам всё поставит).
         if _exe_cached_ok():
+            run_target = _exe_cached_path()
             hint("Запускаю официальный установщик Legacy Launcher...")
             try:
-                os.startfile(str(exe_cand))  # noqa: S606 — явное действие пользователя
+                os.startfile(str(run_target))  # noqa: S606 — явное действие пользователя
                 ok("Установщик запущен.")
                 hint("После установки открой Legacy Launcher из меню «Пуск»,"
                      " скачай в нём версию Minecraft и повтори `legacy` —"
@@ -1159,7 +1181,7 @@ def setup_legacy():
                 return True
             except Exception as e:
                 debug.dbg(f"startfile: {e}", level="WARN")
-                hint(f"Запусти вручную двойным кликом: {exe_cand}")
+                hint(f"Запусти вручную двойным кликом: {run_target}")
                 return True
 
     good = setup_legacy_portable()
@@ -1172,8 +1194,12 @@ def setup_legacy():
         hint("Portable не скачался — пробую запасной вариант: "
              ".exe-установщик через curl.exe (как браузер)")
         exe_path = WINE_DIR / "legacy-portable" / "LegacyLauncher-setup.exe"
-        from modules.download import (download_via_curl)
+        from modules.download import (download_via_curl,
+                                      warn_if_windows_proxy)
         from modules.config import LEGACY_WIN_OFFICIAL_CDN
+        # Перед каждой загрузкой — проверка прокси в настройках Windows:
+        # включённый прокси даёт «долго думает, но качает» и рвёт TLS.
+        warn_if_windows_proxy()
         exe_urls = [u for _, u in LEGACY_WIN_OFFICIAL_CDN] + \
                    ["https://dl.legacylauncher.ru/legacy/installer"]
         got = False

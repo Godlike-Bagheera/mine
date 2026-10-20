@@ -346,8 +346,15 @@ _PRISM_PROXY_PREFIXES = ("https://ghfast.top/", "https://ghproxy.net/",
 # раньше такое «скачивание» молча проходило проверку min_size_mb=10 только по
 # размеру zip-а; теперь download_file дополнительно сверяет точный размер и
 # магические байты PK\x03\x04 (см. _prism_zip_ok в minecraft.py).
+#
+# dlcdn.com.cdn.delivered.by — тот же Яндекс-CDN, который для Legacy
+# стабильно проходит школьные сети (см. LEGACY_WIN_OFFICIAL_CDN): GitHub
+# отдаёт ему свой asset напрямую, домен Яндекса фильтры обычно не рвут.
+PRISM_YANDEX_CDN_URL = ("https://dlcdn.com.cdn.delivered.by/" +
+                        PRISM_WIN_ZIP_URL.removeprefix("https://"))
 PRISM_WIN_URLS = [
     ("GitHub (релиз)", PRISM_WIN_ZIP_URL),
+    ("Яндекс CDN (delivered.by)", PRISM_YANDEX_CDN_URL),
     ("ghfast.top", _PRISM_PROXY_PREFIXES[0] + PRISM_WIN_ZIP_URL),
     ("ghproxy.net", _PRISM_PROXY_PREFIXES[1] + PRISM_WIN_ZIP_URL),
     ("gh.llkk.cc", _PRISM_PROXY_PREFIXES[2] + PRISM_WIN_ZIP_URL),
@@ -368,6 +375,14 @@ LEGACY_WIN_OFFICIAL_CDN = [
      "https://dl-cdn-yc.legacylauncher.ru/legacy/installer/LegacyLauncher.exe"
      "?md5=amzePVm455iPVFWWsKbn8A&expires=1792485882"),
 ]
+
+# Скачанный браузером установщик Legacy тоже принимаем: в Windows он
+# кладёт файл как «Legacy Launcher Setup.exe» (с пробелами) — раньше поиск
+# кэша знал только наше имя LegacyLauncher-setup.exe, и уже скачанный
+# установщик не находился, скрипт качал 117 МБ заново.
+LEGACY_EXE_CACHE_NAMES = ("LegacyLauncher-setup.exe",
+                          "Legacy Launcher Setup.exe",
+                          "LegacyLauncherSetup.exe")
 
 LEGACY_JAR_WIN_MIRRORS = [
     # Сначала пробуем быстрые .jar зеркала — если сеть их не блокирует, это

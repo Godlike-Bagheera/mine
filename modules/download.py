@@ -333,6 +333,129 @@ CURL_BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                    "Chrome/124.0.0.0 Safari/537.36")
 
 
+_proxy_warned = False
+
+
+def windows_ie_proxy():
+    """Настроен ли в Windows прокси (параметр ProxyEnable в IE-настройках).
+
+    Читает реестр напрямую, а не через urllib.getproxies(): последний вернёт
+    пустой словарь и при ProxyEnable=1 с пустым ProxyServer, и наоборот —
+    для проверки «выключен ли прокси» нужен именно флаг. Возвращает dict
+    {"enabled": bool, "server": str}; на не-Windows или при любой ошибке —
+    {"enabled": False, "server": ""} (никогда не бросает исключений).
+
+    Смысл: включённый прокси (особенно MITM-фильтры вроде школьных) ломает
+    TLS-рукопожатие Python («Missing Authority Key Identifier»), рвёт
+    schannel-рукопожатие curl (rc=35) и делает Yandex-CDN заметно медленнее
+    (прокси буферит весь ответ перед выдачей). curl без --noproxy сам
+    подхватывает системный прокси из реестра — поэтому предупреждаем один раз
+    перед каждой загрузкой. Отключить: Параметры → Сеть и Интернет → Прокси →
+    «Использовать прокси-сервер» — ВЫКЛ; либо `netsh winhttp reset proxy`.
+    """
+    out = {"enabled": False, "server": ""}
+    try:
+        from modules.platform_utils import IS_WINDOWS as _IS_WIN
+        if not _IS_WIN:
+            return out
+        import winreg
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
+        with key:
+            try:
+                out["enabled"] = bool(winreg.QueryValueEx(key, "ProxyEnable")[0])
+            except OSError:
+                pass
+            try:
+                out["server"] = str(winreg.QueryValueEx(key, "ProxyServer")[0])
+            except OSError:
+                pass
+    except Exception as e:
+        debug.dbg(f"windows_ie_proxy: {e}", level="WARN")
+    return out
+
+
+def warn_if_windows_proxy():
+    """Однократное (за запуск скрипта) предупреждение о включённом прокси."""
+    global _proxy_warned
+    if _proxy_warned:
+        return
+    px = windows_ie_proxy()
+    if not px["enabled"]:
+        debug.dbg("proxy check: прокси в настройках Windows выключен")
+        return
+    _proxy_warned = True   # предупреждаем один раз, чтобы не спамить на зеркалах
+    server = px["server"] or "(адрес не указан)"
+    warn(f"В настройках Windows ВКЛЮЧЕН прокси ({server}).")
+    hint("Прокси замедляет закачку (буферизует ответ целиком) и может рвать")
+    hint("TLS-рукопожатия: 'SSL/TLS connection failed' у curl и 'Missing")
+    hint("Authority Key Identifier' у Python — типичные его симптомы.")
+    hint("Выключи: Параметры -> Сеть и Интернет -> Прокси ->")
+    hint("'Использовать прокси-сервер' = ОТКЛ (или netsh winhttp reset proxy)")
+
+
+def _curl_base_args(timeout, extra=None):
+    """Общие аргументы curl. При включённом прокси Windows добавляем
+    --noproxy '*' — качаем напрямую, как того хочет пользователь.
+
+    ВАЖНО (лечит «prism также выдает ошибку»): раньше здесь стояли
+    `--fail` и `--retry 2`. На GitHub-редиректах (Prism, все gh-proxy
+    зеркала) при обрыве соединения на середине загрузки curl с --retry
+    ДОБИРАЕТ файл вторым запросом с Range, но сервер отдаёт новый
+    полный поток без 206 — curl дописывает его к огрыжку и молча
+    возвращает rc=0. Результат: «скачанный» zip битый (внутри нет
+    prismlauncher.exe / icu*.dll) или HTML-заглушка прокси проходит
+    проверку по размеру. Теперь: --proto-redir (HTTPS не деградит в
+    HTTP), --continue-at - (доводит обрыв честным Range, без склейки
+    двух полных потоков), без --fail/--retry (недокачка честно
+    возвращается rc!=0, зеркало перепробуется с чистого tmp)."""
+    args = ["--location-trusted", "--http1.1",
+            "--proto-redir", "https",
+            "--connect-timeout", str(timeout // 4 or 15),
+            "--max-time", str(timeout),
+            "--user-agent", CURL_BROWSER_UA]
+    if windows_ie_proxy()["enabled"]:
+        args += ["--noproxy", "*"]
+    if extra:
+        args += list(extra)
+    return args
+
+
+def _run_curl_resume(exe, url, tmp, timeout, extra=None):
+    """Докачка оборванного файла: тот же curl + `-C -`.
+
+    Если предыдущий запуск оставил .curlpart/.part меньшего размера,
+    curl продолжит с конца (Range) вместо новой закачки с нуля. Возвращает
+    (ok, errtext) — формат как у _run_curl. Не подходит для URL с
+    одноразовыми подписями (?md5=&expires=...) — там повторный Range
+    может получить 403, поэтому вызывающий код решает, можно ли докачивать.
+    """
+    if not Path(tmp).exists():
+        return False, "нет частичного файла для докачки"
+    cmd = [exe, "-C", "-"] + _curl_base_args(timeout, extra) \
+        + ["--output", str(tmp), url]
+    try:
+        r = subprocess.run(cmd, check=False, timeout=timeout + 90,
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.PIPE)
+        if r.returncode == 0 and Path(tmp).exists() \
+                and Path(tmp).stat().st_size > 0:
+            return True, ""
+        # rc=33 — сервер не поддерживает Range: считаем недокачкой,
+        # вызывающий код начнёт заново с чистого tmp.
+        errtxt = ""
+        try:
+            lines = (r.stderr or b"").decode("utf-8", errors="ignore") \
+                .strip().splitlines()
+            errtxt = lines[-1] if lines else ""
+        except Exception:
+            pass
+        return False, f"rc={r.returncode}: {errtxt}"
+    except Exception as e:
+        return False, str(e)
+
+
 def _fmt_speed(bps):
     """Красивый вывод скорости."""
     if bps < 1024:
@@ -365,16 +488,73 @@ def _curl_head_size(exe, url, timeout=15):
     return None
 
 
+def _curl_http_code(exe, url, timeout=15):
+    """Реальный HTTP-код ответа curl после следования редиректам (-w %{http_code}).
+
+    Нужен потому, что без --fail curl при rc=0 молча сохраняет и 403, и
+    HTML-заглушку зеркала — «успешная» закачка мусора давала битые архивы
+    Prism/Legacy. Возвращает int или None (сеть/ошибка).
+    """
+    try:
+        cmd = [exe, "-o", os.devnull, "--silent", "--show-error",
+               "--location-trusted", "--http1.1",
+               "--connect-timeout", str(max(timeout // 3, 5)),
+               "--max-time", str(timeout),
+               "--user-agent", CURL_BROWSER_UA,
+               "-w", "%{http_code}", url]
+        if windows_ie_proxy()["enabled"]:
+            cmd += ["--noproxy", "*"]
+        r = subprocess.run(cmd, check=False, timeout=timeout + 10,
+                           stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL)
+        out = (r.stdout or b"").decode("ascii", errors="ignore").strip()
+        if out.isdigit():
+            return int(out)
+    except Exception as e:
+        debug.dbg(f"_curl_http_code: {e}", level="WARN")
+    return None
+
+
+def _curl_http_ok(errtxt):
+    """errtxt из _run_curl/_curl_with_progressbar: пустая строка — всё ок;
+    'NNN' — HTTP-код ошибки (rc был 0). True, если ошибок нет."""
+    return errtxt == ""
+
+
+_CURL_OK_CODES = {"200", "206", "301", "302", "303", "307", "308"}
+
+
+def _downloaded_file_plausible(dest_tmp, url=""):
+    """Здравый смысл скачанного файла до переноса на место назначения.
+
+    Ловит два типовых мусора, которые раньше проходили по размеру:
+      1) HTML-заглушка прокси/зеркала (gh-proxy отдаёт страницу вместо
+         zip'а) — начинается с '<';
+      2) .zip/.jar/.mrpack без магических байтов PK\\x03\\x04 (обрывок,
+         склейка двух потоков после --retry).
+    Прочие расширения (.exe и т.п.) проверяем только на HTML.
+    """
+    try:
+        p = Path(dest_tmp)
+        if not p.is_file() or p.stat().st_size < 512:
+            return False
+        with open(p, "rb") as f:
+            head = f.read(16)
+        low = head.lower().lstrip(b"\xef\xbb\xbf \t\r\n")
+        if low[:1] == b"<":           # <!DOCTYPE / <html — заглушка
+            return False
+        suffix = p.suffix.lower()
+        if suffix in (".zip", ".jar", ".mrpack"):
+            return head[:4] == b"PK\x03\x04"
+        return True
+    except OSError:
+        return False
+
+
 def _curl_with_progressbar(exe, url, tmp, timeout, extra=None, expected_size=None):
     """curl с live progress bar (для больших файлов)."""
-    base_cmd = [exe, "--fail", "--location-trusted", "--http1.1",
-                "--retry", "2", "--retry-delay", "1",
-                "--connect-timeout", str(timeout // 4 or 15),
-                "--max-time", str(timeout),
-                "--user-agent", CURL_BROWSER_UA,
-                "--output", str(tmp)]
-    if extra:
-        base_cmd += list(extra)
+    base_cmd = ([exe] + _curl_base_args(timeout, extra)
+                + ["--output", str(tmp)])
     base_cmd.append(url)
 
     debug.dbg(f"curl: {' '.join(base_cmd)}")
@@ -445,6 +625,13 @@ def _curl_with_progressbar(exe, url, tmp, timeout, extra=None, expected_size=Non
 
         if rc == 0 and Path(str(tmp)).exists() \
                 and Path(str(tmp)).stat().st_size > 0:
+            # Без --fail curl вернёт 0 и на HTTP 403/503 с HTML-заглушкой.
+            # Быстрая проверка фактического кода после редиректов; ошибку
+            # возвращаем в формате "HTTP NNN" (download_via_curl отличает
+            # её от сетевой по непустой строке).
+            code = _curl_http_code(exe, url, timeout=min(15, max(timeout // 4, 8)))
+            if code is not None and str(code) not in _CURL_OK_CODES:
+                return False, f"HTTP {code}"
             return True, ""
 
         return False, f"rc={rc}"
@@ -477,14 +664,7 @@ def _run_curl(exe, url, tmp, timeout, extra=None):
         return _curl_with_progressbar(exe, url, tmp, timeout, extra, expected_size)
 
     # Обычный режим для маленьких файлов
-    cmd = [exe, "--fail", "--location-trusted", "--http1.1",
-           "--retry", "2", "--retry-delay", "1",
-           "--connect-timeout", str(timeout // 4 or 15),
-           "--max-time", str(timeout),
-           "--user-agent", CURL_BROWSER_UA,
-           "--output", str(tmp)]
-    if extra:
-        cmd += list(extra)
+    cmd = [exe] + _curl_base_args(timeout, extra) + ["--output", str(tmp)]
     cmd.append(url)
     debug.dbg(f"curl (small): {' '.join(cmd)}")
 
@@ -493,6 +673,10 @@ def _run_curl(exe, url, tmp, timeout, extra=None):
                            stdout=subprocess.DEVNULL,
                            stderr=subprocess.PIPE)
         if r.returncode == 0 and tmp.exists() and tmp.stat().st_size > 0:
+            # Как в прогресс-режиме: без --fail rc=0 бывает и на 403/503.
+            code = _curl_http_code(exe, url, timeout=min(15, max(timeout // 4, 8)))
+            if code is not None and str(code) not in _CURL_OK_CODES:
+                return False, f"HTTP {code}"
             return True, ""
         errtxt = ""
         try:
@@ -524,7 +708,30 @@ def download_via_curl(url, dest, timeout=CONNECT_TIMEOUT * 4):
     if not exe:
         return _download_via_wget(url, dest, timeout)
     tmp = Path(str(dest) + ".curlpart")
-    attempts = [[], ["--noproxy", "*"]]
+    # Докачка с прошлого запуска: если остался .curlpart и URL не с
+    # одноразовой подписью (Yandex CDN md5/expires может отдать 403 на
+    # повторном Range), сначала честно продолжаем -C -.
+    try:
+        if tmp.exists() and tmp.stat().st_size > 0 \
+                and "expires=" not in url.lower():
+            r_ok, r_err = _run_curl_resume(exe, url, tmp, timeout)
+            if r_ok and _curl_http_ok(r_err) \
+                    and _downloaded_file_plausible(tmp):
+                os.replace(tmp, dest)
+                debug.dbg("curl: докачали оборванный файл (-C -)")
+                return True
+            #Range не поддержан или мусор — начинаем заново с чистого tmp
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+    except Exception as e:
+        debug.dbg(f"curl resume skip: {e}", level="WARN")
+    # Если в Windows включён прокси — обходим его напрямую (_curl_base_args
+    # добавит --noproxy '*'); отдельный --noproxy-заход тогда не нужен.
+    attempts = [[]]
+    if not windows_ie_proxy()["enabled"]:
+        attempts.append(["--noproxy", "*"])
     if _insecure_fallback_allowed():
         attempts.append(["--insecure"])
         warn("curl: нестрогая проверка сертификатов "
@@ -532,9 +739,26 @@ def download_via_curl(url, dest, timeout=CONNECT_TIMEOUT * 4):
     last_err = ""
     for extra in attempts:
         ok_, errtxt = _run_curl(exe, url, tmp, timeout, extra)
-        if ok_:
+        if ok_ and _curl_http_ok(errtxt):
+            # Проверка содержимого до переноса: gh-proxy/HTML-заглушка или
+            # склеенный при обрыве zip раньше проходили по размеру и
+            # «успешно устанавливались» битком — отсюда ошибки Prism после
+            # «удачной» закачки.
+            if not _downloaded_file_plausible(dest_tmp=tmp, url=url):
+                warn("  curl скачал мусор (HTML/битый архив) — пробую "
+                     "дальше")
+                try:
+                    if tmp.exists():
+                        tmp.unlink()
+                except OSError:
+                    pass
+                continue
             os.replace(tmp, dest)
             return True
+        if ok_:
+            # rc=0, но в выводе есть HTTP-код ошибки (без --fail curl так
+            # молча сохраняет 404/503-страницы как «успех»)
+            errtxt = f"HTTP {errtxt}"
         last_err = errtxt
         debug.dbg(f"curl attempt failed ({extra}): {errtxt}", level="WARN")
     if last_err:
@@ -573,12 +797,18 @@ def _download_via_wget(url, dest, timeout):
     return False
 
 
+def _curl_noproxy_args():
+    """--noproxy '*' если в Windows включён системный прокси — HEAD-пробы и
+    закачки должны идти напрямую (прокси буферит ответ и рвёт TLS)."""
+    return ["--noproxy", "*"] if windows_ie_proxy()["enabled"] else []
+
+
 def _curl_head_ok(exe, url, timeout=20):
     """Быстрая HEAD-проверка живости зеркала через curl (-I). True/False."""
     cmd = [exe, "-I", "-s", "-o", os.devnull, "--http1.1",
            "--connect-timeout", str(max(timeout // 3, 8)),
            "--max-time", str(timeout),
-           "--user-agent", CURL_BROWSER_UA, url]
+           "--user-agent", CURL_BROWSER_UA] + _curl_noproxy_args() + [url]
     try:
         r = subprocess.run(cmd, check=False, timeout=timeout + 15,
                            stdout=subprocess.DEVNULL,
@@ -593,7 +823,8 @@ def _curl_head_ok(exe, url, timeout=20):
                 "--connect-timeout", str(max(timeout // 3, 8)),
                 "--max-time", str(timeout),
                 "--user-agent", CURL_BROWSER_UA,
-                "--write-out", "%{http_code}", "--output", os.devnull, url]
+                "--write-out", "%{http_code}", "--output", os.devnull] \
+            + _curl_noproxy_args() + [url]
         r2 = subprocess.run(cmd2, check=False, timeout=timeout + 15,
                             stdout=subprocess.PIPE,
                             stderr=subprocess.DEVNULL)
@@ -647,17 +878,31 @@ def download_queue_with_curl(mirrors, dest, min_bytes=1024, silent=False):
     ПЕРВЫЙ путь на Windows: питоновские попытки при RST-блокировке только
     жгут время и выводят пользователя из себя длинными списками ошибок.
 
-    Перед прогоном очередь переупорядочивается быстрым HEAD-пробом
+    Перед прогоном проверяем настройки Windows: включённый прокси замедляет
+    закачку и ломает TLS — предупреждаем и обходим его (--noproxy).
+    Затем очередь переупорядочивается быстрым HEAD-пробом
     (probe_mirrors_with_curl), чтобы зависшее зеркало не блокировалось
     долгими таймаутами раньше живого.
     """
     if not shutil_which_curl():
         return None
+    warn_if_windows_proxy()
     mirrors = probe_mirrors_with_curl(mirrors)
     for name, url in mirrors:
         try:
             if dest.exists() and dest.stat().st_size >= max(min_bytes, 1024):
-                return url
+                # Раньше здесь был просто «размер подошёл -> успех». На
+                # gh-proxy-зеркала это означало: HTML-заглушка > min_bytes
+                # засчитывалась скачанной, и Prism «успешно устанавливался»
+                # битым. Проверяем содержимое; мусор удаляем и идём дальше.
+                if _downloaded_file_plausible(dest):
+                    return url
+                warn(f"  {name}: в кэше мусор (HTML/битый архив), "
+                     f"перекачиваю")
+                try:
+                    dest.unlink()
+                except OSError:
+                    pass
         except OSError:
             pass
         if not silent:
@@ -1007,6 +1252,11 @@ def try_download_manual(name, url, dest, silent=False):
 def download_file(mirrors, dest, label, min_size_mb=10, silent=False,
                   exact_size=None):
     WINE_DIR.mkdir(parents=True, exist_ok=True)
+    # Проверка прокси Windows ПЕРЕД любой загрузкой: включённый прокси —
+    # частая причина «долго думает, но качает» (буферизация) и TLS-ошибок.
+    from modules.platform_utils import IS_WINDOWS as _IS_WIN_ALL
+    if _IS_WIN_ALL:
+        warn_if_windows_proxy()
     # min_size_mb=0 раньше пропускал любую закачку, включая пустые/обрубки:
     # `st_size >= 0` истинно для любого файла. Ставим нижний порог 1 КБ —
     # реальные артефакты (jar, mrpack, tar.gz) всё равно больше.
