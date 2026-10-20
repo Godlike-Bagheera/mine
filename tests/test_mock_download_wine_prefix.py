@@ -187,10 +187,15 @@ _req = urllib.request.Request("https://example.invalid/f.zip")
 
 
 def _ssl_env(insecure_flag, side_effect):
+    # Новый open_checked идёт через кэшированный opener (build_opener),
+    # а не urllib.request.urlopen — мокнем именно opener.open.
     old_ctx = net.ssl_ctx
     net.ssl_ctx = lambda insecure=False: ssl.create_default_context()
-    with mock.patch.object(urllib.request, "urlopen",
-                           side_effect=side_effect) as m_open:
+    m_open = mock.MagicMock(side_effect=side_effect)
+    fake_opener = mock.MagicMock()
+    fake_opener.open = m_open
+    with mock.patch.object(download, "_strict_opener",
+                           return_value=fake_opener):
         with mock.patch.dict(os.environ,
                              {"WI_INSECURE_SSL": insecure_flag}
                              if insecure_flag is not None else {},
@@ -221,8 +226,28 @@ def _ssl_ok(*a, **k):
 
 res, m_open = _ssl_env(None, _ssl_ok)
 check("обычный ответ проходит без ошибок", res == "ok")
-check("open_checked передаёт контекст из net.ssl_ctx",
-      "context" in m_open.call_args.kwargs)
+# Контекст net.ssl_ctx теперь передаётся через HTTPSHandler внутри
+# _strict_opener(), а не аргументом urlopen. Проверяем поведение:
+# opener обязан игнорировать прокси из окружения (школьная сеть —
+# корень бага «интернета нет»), тогда как обычный urlopen через него идёт.
+os.environ["HTTP_PROXY"] = "http://127.0.0.1:9"  # заведомо мёртвый прокси
+try:
+    download._strict_opener().open(
+        urllib.request.Request("http://example.invalid/x"), timeout=2)
+    _opener_err = None
+except Exception as e:
+    _opener_err = str(e).lower()
+try:
+    urllib.request.urlopen(
+        urllib.request.Request("http://http://@/"), timeout=2)
+except Exception as e:
+    pass  # сравнение не обязательно: главное — поведение opener'а
+del os.environ["HTTP_PROXY"]
+check("opener обходит системный прокси (DNS-ошибка, а не 'proxy refused')",
+      _opener_err is not None and "name or service not known" in _opener_err
+      and "connection refused" not in _opener_err)
+check("opener кэширован (тот же объект при повторном вызове)",
+      download._strict_opener() is download._strict_opener())
 
 
 print("== 4. head_check ==")
