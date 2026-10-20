@@ -415,6 +415,14 @@ def _is_tls_fail(errtxt):
     не прошло (свежий Schannel + TLS 1.3 не дружат с Cloudflare и рядом
     CDN; лечится --tlsv1.2). rc=6 — DNS не резолвится, это НЕ TLS-ошибка."""
     t = (errtxt or "").lower()
+    # «rc=35» — формат, которым сам код возвращает ошибку без текста stderr
+    # (_curl_with_progressbar: f"rc={rc}"). Раньше эта ветка ловила только
+    # фразы вроде "SSL connect error" из stderr, и при пустом stderr
+    # («curl attempt failed ([]): rc=35») обходы --tlsv1.2/--http2 НЕ
+    # добавлялись в очередь — все заходы падали с тем же rc=35, и установка
+    # Legacy в школьной сети превращалась в простыню «curl не смог: rc=35».
+    if "rc=35" in t or "rc=35:" in t or "code 35" in t:
+        return True
     if "error 35" in t or "ssl connect error" in t \
             or "schannel" in t or "tls" in t:
         return True
@@ -757,6 +765,13 @@ def download_via_curl(url, dest, timeout=CONNECT_TIMEOUT * 4, extra=None):
     exe = shutil_which_curl()
     if not exe:
         return _download_via_wget(url, dest, timeout)
+    # Если HEAD-проба (probe_mirrors_with_curl) уже выяснила, что зеркало
+    # живо только с TLS-фиксом, а вызывающий код не передал extra —
+    # подхватим фикс из кэша сами. Иначе первый заход снова падает с
+    # rc=35 (~20 с таймаута на зеркало), и пользователь видит простыню
+    # «curl не смог: rc=35» по всем зеркалам Legacy.
+    if not extra:
+        extra = _tls_fix_cache.get(url)
     tmp = Path(str(dest) + ".curlpart")
     # Докачка с прошлого запуска: если остался .curlpart и URL не с
     # одноразовой подписью (Yandex CDN md5/expires может отдать 403 на
@@ -906,6 +921,58 @@ def _curl_head_ok(exe, url, timeout=20, extra=None):
         return False
 
 
+def _curl_head_rc(exe, url, timeout=10, extra=None):
+    """curl -I без --fail: возвращает returncode (0/35/6/28...), None при сбое.
+
+    Нужен чтобы отличать TLS-облом HEAD (rc=35 — зеркало живо для GET'а,
+    рвётся только рукопожатие на -I) от мёртвых rc=6 (DNS) / rc=7 / таймаута.
+    """
+    cmd = [exe, "-I", "-s", "-o", os.devnull, "--http1.1",
+           "--connect-timeout", str(max(timeout // 3, 4)),
+           "--max-time", str(timeout),
+           "--user-agent", CURL_BROWSER_UA] \
+        + _curl_noproxy_args() + list(extra or []) + [url]
+    try:
+        r = subprocess.run(cmd, check=False, timeout=timeout + 10,
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
+        return r.returncode
+    except Exception as e:
+        debug.dbg(f"curl -I(rc) {url}: {e}", level="WARN")
+        return None
+
+
+def _curl_get_probe_ok(exe, url, timeout=15, extra=None):
+    """Живость зеркала коротким GET'ом первых байт (--max-filesize).
+
+    Некоторые фильтры рвут именно HEAD (-I), а GET проходит; HEAD-проба
+    тогда ошибочно отправляла рабочее зеркало в конец очереди. Скачиваем
+    максимум ~64 КБ и проверяем HTTP-код после редиректов.
+    """
+    cmd = [exe, "-sS", "-o", os.devnull, "--http1.1",
+           "--location-trusted", "--proto-redir", "https",
+           "--max-filesize", "65536",
+           "--connect-timeout", str(max(timeout // 3, 4)),
+           "--max-time", str(timeout),
+           "--user-agent", CURL_BROWSER_UA,
+           "-w", "%{http_code}"] \
+        + _curl_noproxy_args() + list(extra or []) + [url]
+    try:
+        r = subprocess.run(cmd, check=False, timeout=timeout + 10,
+                           stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL)
+        out = (r.stdout or b"").decode("ascii", errors="ignore").strip()
+        code = out.splitlines()[-1] if out else ""
+        # --max-filesize отдаёт rc=63, когда файл больше лимита — это
+        # как раз нормальный ответ живого зеркала (файл есть, он большой).
+        if r.returncode in (0, 63) and code.isdigit() \
+                and int(code) < 400:
+            return True
+    except Exception as e:
+        debug.dbg(f"curl GET-probe {url}: {e}", level="WARN")
+    return False
+
+
 def probe_mirrors_with_curl(mirrors, budget_sec=25):
     """Проверяет живость зеркал быстрым curl -I и возвращает новый список.
 
@@ -944,8 +1011,28 @@ def probe_mirrors_with_curl(mirrors, budget_sec=25):
             _tls_fix_cache[url] = ["--tlsv1.2"]
             alive.insert(0, item)
         else:
-            debug.dbg(f"probe: {name} недоступен/медлит — отодвигаю")
-            dead.append(item)
+            # Сетевые фильтры (DPI/прокси) иногда рвут ТОЛЬКО HEAD-запросы,
+            # а обычный GET через curl проходит нормально. Раньше такое
+            # зеркало безоговорочно отодвигалось в конец, и рабочее зеркало
+            # (например llaun.ch) оказывалось заведомо мёртвым — очередь
+            # закачки перепробовала мусор первым. Теперь даём второй шанс:
+            # если HEAD упал именно по TLS (rc=35), пробуем GET с фиксами
+            # --tlsv1.2 / --http2; при успехе запоминаем рабочий фикс.
+            tlsfix_ok = False
+            if _curl_head_rc(exe, url, timeout=min(10, per)) == 35:
+                for tlsfix in (["--tlsv1.2"], ["--http2"]):
+                    if _curl_get_probe_ok(exe, url, timeout=min(15, per),
+                                          extra=tlsfix):
+                        debug.dbg(f"probe: {name} — HEAD рвётся TLS (rc=35), "
+                                  f"GET жив с {tlsfix[0]}")
+                        _tls_fix_cache[url] = list(tlsfix)
+                        tlsfix_ok = True
+                        break
+            if tlsfix_ok:
+                alive.append(item)
+            else:
+                debug.dbg(f"probe: {name} недоступен/медлит — отодвигаю")
+                dead.append(item)
     return alive + dead
 
 

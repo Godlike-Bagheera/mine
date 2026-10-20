@@ -403,8 +403,14 @@ def _prism_zip_ok(path, min_mb=10):
         with zipfile.ZipFile(path) as z:
             names = [n.split("/")[-1].lower() for n in z.namelist()]
             has_exe = "prismlauncher.exe" in names
-            has_icu = any(n.startswith("icu") and n.endswith(".dll")
-                          for n in names)
+            # ВАЖНО: у MinGW-w64 Portable (основная сборка, см. config.py)
+            # ICU-DLL называются libicuuc78.dll / libicuin78.dll /
+            # libicudt78.dll — они НЕ начинаются с "icu". Строгая проверка
+            # startswith("icu") считала валидный архив битым («Скачанный
+            # файл не похож на Portable-архив... Перекачай») и запускала
+            # бесконечный круг перекачиваний. Ищем ЛЮБОЙ *icu*.dll — ровно
+            # как в _prism_has_icu (проверка уже распакованной папки).
+            has_icu = any("icu" in n and n.endswith(".dll") for n in names)
             return has_exe and has_icu
     except Exception as e:
         debug.dbg_exc(e, "_prism_zip_ok")
@@ -669,7 +675,9 @@ def setup_prism():
         if not _prism_has_icu(exe):
             err("Рядом с prismlauncher.exe нет icu*.dll — это НЕ portable-"
                 "сборка (тот самый запуск даёт «не обнаружена icu.DLL»).")
-            hint("Нужен файл вида PrismLauncher-Windows-MSVC-Portable-*.zip")
+            hint("Нужен файл вида "
+                 "PrismLauncher-Windows-MinGW-w64-Portable-*.zip "
+                 "(или MSVC-Portable) — Portable, не Installer")
             return False
         ok(f"Prism: {exe}")
         hint("Запускаю...")
