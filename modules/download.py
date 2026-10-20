@@ -333,8 +333,150 @@ CURL_BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                    "Chrome/124.0.0.0 Safari/537.36")
 
 
+def _fmt_speed(bps):
+    """Красивый вывод скорости."""
+    if bps < 1024:
+        return f"{bps:.0f} Б/с"
+    elif bps < 1024 * 1024:
+        return f"{bps / 1024:.1f} КБ/с"
+    else:
+        return f"{bps / 1024 / 1024:.1f} МБ/с"
+
+
+def _curl_head_size(exe, url, timeout=15):
+    """Быстрый HEAD-запрос для получения размера файла. Возвращает байты или None."""
+    try:
+        cmd = [exe, "-I", "--silent", "--show-error",
+               "--connect-timeout", str(timeout // 3),
+               "--max-time", str(timeout),
+               "--location-trusted",
+               "--user-agent", CURL_BROWSER_UA,
+               url]
+        r = subprocess.run(cmd, check=False, timeout=timeout + 5,
+                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        for line in (r.stdout or b"").decode("utf-8", errors="ignore").splitlines():
+            low = line.lower().strip()
+            if low.startswith("content-length:"):
+                val = low.split(":", 1)[1].strip()
+                if val.isdigit():
+                    return int(val)
+    except Exception as e:
+        debug.dbg(f"_curl_head_size: {e}", level="WARN")
+    return None
+
+
+def _curl_with_progressbar(exe, url, tmp, timeout, extra=None, expected_size=None):
+    """curl с live progress bar (для больших файлов)."""
+    base_cmd = [exe, "--fail", "--location-trusted", "--http1.1",
+                "--retry", "2", "--retry-delay", "1",
+                "--connect-timeout", str(timeout // 4 or 15),
+                "--max-time", str(timeout),
+                "--user-agent", CURL_BROWSER_UA,
+                "--output", str(tmp)]
+    if extra:
+        base_cmd += list(extra)
+    base_cmd.append(url)
+
+    debug.dbg(f"curl: {' '.join(base_cmd)}")
+
+    proc = None
+    last_bytes = 0
+    start_time = time.time()
+    total_known = expected_size
+
+    try:
+        import re
+        cmd = base_cmd.copy()
+        cmd.insert(1, "--progress-bar")
+
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            bufsize=1,
+            universal_newlines=True,
+            encoding='utf-8',
+            errors='replace'
+        )
+
+        # Читаем stderr построчно (curl пишет прогресс туда)
+        for line in proc.stderr:
+            parts = line.split('\r')
+            status = parts[-1].strip()
+
+            # Парсим формат curl --progress-bar:
+            # "####---  45%  1.2M  0:00:05  0:00:03  0:00:02"
+            m = re.search(r'(\d+)%.*?([\d.]+)([KMGT]?i?B)', status)
+            if m:
+                pct = int(m.group(1))
+                num = float(m.group(2))
+                unit = m.group(3)
+
+                mult = {'K': 1024, 'M': 1024**2, 'G': 1024**3,
+                        'Ki': 1024, 'Mi': 1024**2, 'Gi': 1024**3}
+                bytes_dl = int(num * mult.get(unit, 1))
+
+                elapsed = time.time() - start_time
+                speed = bytes_dl / max(elapsed, 0.1)
+
+                eta_sec = ((100 - pct) / max(pct, 1)) * elapsed if pct > 0 else 0
+
+                bar_len = 30
+                filled = int(bar_len * pct / 100)
+                bar = '█' * filled + '░' * (bar_len - filled)
+
+                mb_dl = bytes_dl / 1024 / 1024
+                if total_known and total_known > 0:
+                    mb_tot = total_known / 1024 / 1024
+                    size_info = f"{mb_dl:.1f}/{mb_tot:.1f} МБ"
+                else:
+                    size_info = f"{mb_dl:.1f} МБ"
+
+                msg = (f"\r  {CYAN}[{bar}]{RESET} {pct:3d}% "
+                       f"{size_info} ({_fmt_speed(speed)}) ETA:{eta_sec:.0f}s   ")
+                print(msg, end='', flush=True)
+                last_bytes = bytes_dl
+
+        proc.wait()
+        rc = proc.returncode
+
+        if last_bytes > 0:
+            print()
+
+        if rc == 0 and Path(str(tmp)).exists() \
+                and Path(str(tmp)).stat().st_size > 0:
+            return True, ""
+
+        return False, f"rc={rc}"
+
+    except Exception as e:
+        if proc:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        return False, str(e)
+
+
 def _run_curl(exe, url, tmp, timeout, extra=None):
-    """Один запуск curl.exe -> tmp. Возвращает (True|False, текст_ошибки)."""
+    """Один запуск curl.exe -> tmp. Возвращает (True|False, текст_ошибки).
+
+    Автоматически выбирает режим: обычный для быстрых скачиваний,
+    с прогресс-баром для больших файлов (>3 МБ ожидаемо).
+    """
+    # Пробуем узнать размер через HEAD (быстро, до 10 сек)
+    head_timeout = min(10, timeout // 6)
+    expected_size = _curl_head_size(exe, url, timeout=head_timeout)
+
+    debug.dbg(f"_run_curl: expected_size={expected_size}")
+
+    # Если файл большой (>3МБ) или неизвестный размер — используем прогресс-бар
+    use_progress = (expected_size is None or expected_size > 3 * 1024 * 1024)
+
+    if use_progress:
+        return _curl_with_progressbar(exe, url, tmp, timeout, extra, expected_size)
+
+    # Обычный режим для маленьких файлов
     cmd = [exe, "--fail", "--location-trusted", "--http1.1",
            "--retry", "2", "--retry-delay", "1",
            "--connect-timeout", str(timeout // 4 or 15),
@@ -344,7 +486,8 @@ def _run_curl(exe, url, tmp, timeout, extra=None):
     if extra:
         cmd += list(extra)
     cmd.append(url)
-    debug.dbg(f"curl: {' '.join(cmd)}")
+    debug.dbg(f"curl (small): {' '.join(cmd)}")
+
     try:
         r = subprocess.run(cmd, check=False, timeout=timeout + 90,
                            stdout=subprocess.DEVNULL,

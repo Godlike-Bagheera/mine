@@ -1109,32 +1109,82 @@ def setup_legacy():
         jar_dir = WINE_DIR / "legacy-portable"
         jar_dir.mkdir(parents=True, exist_ok=True)
         cand = jar_dir / "LegacyLauncher.jar"
+        exe_cand = jar_dir / "LegacyLauncher-setup.exe"
+
+        def _exe_cached_ok():
+            try:
+                return (exe_cand.exists()
+                        and exe_cand.stat().st_size > 2 * 1024 * 1024)
+            except OSError:
+                return False
+
         if not (cand.exists() and cand.stat().st_size >= LEGACY_JAR_MIN_SIZE
-                and _looks_like_jar(cand)):
+                and _looks_like_jar(cand)) \
+                and not _exe_cached_ok():
             mirrors = legacy_jar_mirrors(True)
             dl_url = download_queue_with_curl(mirrors, cand,
                                               min_bytes=LEGACY_JAR_MIN_SIZE)
             if dl_url and cand.exists() and _looks_like_jar(cand):
                 ok(f"Legacy Launcher (.jar) скачан через curl: {dl_url}")
+            elif dl_url and cand.exists():
+                # Официальный CDN отдаёт .exe-установщик (не PK-.jar).
+                # Переименовываем: это рабочий вариант для Windows —
+                # установщик сам ставит лаунчер (Qt-инсталлятор, нативный).
+                try:
+                    os.replace(str(cand), str(exe_cand))
+                    ok("Скачан официальный .exe-установщик Legacy Launcher "
+                       f"({exe_cand.stat().st_size / 1024 / 1024:.0f} МБ)")
+                except OSError as e:
+                    debug.dbg_exc(e, "setup_legacy/rename-exe")
+                    try:
+                        cand.unlink()
+                    except OSError:
+                        pass
             elif cand.exists():
                 try:
                     cand.unlink()   # огрызок/HTML — мешается под кэшем
                 except OSError:
                     pass
 
+        # Если есть скачанный .exe-установщик — запускаем его сразу,
+        # portable .jar больше не нужен (установщик сам всё поставит).
+        if _exe_cached_ok():
+            hint("Запускаю официальный установщик Legacy Launcher...")
+            try:
+                os.startfile(str(exe_cand))  # noqa: S606 — явное действие пользователя
+                ok("Установщик запущен.")
+                hint("После установки открой Legacy Launcher из меню «Пуск»,"
+                     " скачай в нём версию Minecraft и повтори `legacy` —"
+                     " скрипт найдёт установленный лаунчер сам.")
+                return True
+            except Exception as e:
+                debug.dbg(f"startfile: {e}", level="WARN")
+                hint(f"Запусти вручную двойным кликом: {exe_cand}")
+                return True
+
     good = setup_legacy_portable()
     if not good and _IS_WIN:
         # На Windows сеть может рвать и TLS, и Java-запросы лаунчера.
         # Пробуем запасной путь: официальный .exe через curl.exe (Schannel),
         # потом запускаем установщик штатными средствами Windows.
+        # Приоритет — Yandex CDN (проверен: отдаёт настоящий .exe 117 МБ,
+        # медленный старт но стабильная закачка); старый URL — запасной.
         hint("Portable не скачался — пробую запасной вариант: "
              ".exe-установщик через curl.exe (как браузер)")
         exe_path = WINE_DIR / "legacy-portable" / "LegacyLauncher-setup.exe"
-        from modules.download import download_via_curl, shutil_which_curl
-        if shutil_which_curl() and download_via_curl(
-                "https://dl.legacylauncher.ru/legacy/installer", exe_path) \
-                and exe_path.stat().st_size > 2 * 1024 * 1024:
-            good(f"Скачан установщик: {exe_path}")
+        from modules.download import (download_via_curl)
+        from modules.config import LEGACY_WIN_OFFICIAL_CDN
+        exe_urls = [u for _, u in LEGACY_WIN_OFFICIAL_CDN] + \
+                   ["https://dl.legacylauncher.ru/legacy/installer"]
+        got = False
+        for u in exe_urls:
+            info(f"Пробую: {u[:80]}...")
+            if download_via_curl(u, exe_path) \
+                    and exe_path.stat().st_size > 2 * 1024 * 1024:
+                got = True
+                break
+        if got:
+            ok(f"Скачан установщик: {exe_path}")
             try:
                 os.startfile(str(exe_path))  # noqa: S606 — явное действие пользователя
                 hint("Запустился установщик — после установки добавь игру в"

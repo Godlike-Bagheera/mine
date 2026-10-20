@@ -360,12 +360,27 @@ PRISM_WIN_URLS = [
 # curl.exe по всей очереди): archive.org — обычный статичный HTTPS без
 # редиректов иTLS-фиngerprint-блокировок, поэтому первым; официальные
 # домены — следом.
+# Официальный Yandex-CDN Legacy Launcher отдаёт НАСТОЯЩИЙ установщик .exe,
+# проверено работает даже когда все зеркала .jar блокируются сетью.
+# Он медленный (думает 20-30 сек), но стабильный и качает до конца.
+LEGACY_WIN_OFFICIAL_CDN = [
+    ("Yandex CDN (официальный .exe)",
+     "https://dl-cdn-yc.legacylauncher.ru/legacy/installer/LegacyLauncher.exe"
+     "?md5=amzePVm455iPVFWWsKbn8A&expires=1792485882"),
+]
+
 LEGACY_JAR_WIN_MIRRORS = [
+    # Сначала пробуем быстрые .jar зеркала — если сеть их не блокирует, это
+    # самый чистый путь (portable без установщика). Но они часто RST'ятся DPI.
+    ("llaun.ch (официальный)", "https://llaun.ch/jar"),
+    ("dl.llaun.ch (прямой)", "https://dl.llaun.ch/legacy/bootstrap"),
+    # Если .jar недоступны — сразу переходим к официальному .exe через CDN:
+    # он медленнее стартует (долгий HEAD + TLS handshake), но надёжнее проходит
+    # через корпоративные файрволы и школьные MITM-прокси.
+    *LEGACY_WIN_OFFICIAL_CDN,
     ("Archive.org (bootstrap jar)",
      "https://archive.org/download/legacy-launcher-bootstrap/"
      "LegacyLauncher.jar"),
-    ("llaun.ch (официальный)", "https://llaun.ch/jar"),
-    ("dl.llaun.ch (прямой)", "https://dl.llaun.ch/legacy/bootstrap"),
     ("go.legacylauncher.ru", "https://go.legacylauncher.ru/jar"),
 ]
 
