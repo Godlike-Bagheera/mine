@@ -351,6 +351,179 @@ check("netcheck в EXPECTED_COMMANDS", "netcheck" in EXPECTED_COMMANDS)
 check("netcheck зарегистрирован в COMMAND_REGISTRY",
       "netcheck" in COMMAND_REGISTRY)
 
+# ═══ 11. Legacy: общий бюджет curl-попыток, честный валидатор, один круг ═══
+import modules.download as dl_mod2              # noqa: E402
+
+# 11.1 Бюджет попыток: очередь из 20 зеркал не даёт 20 заходов
+check("_curl_attempt_budget ограничен MAX_CURL_QUEUE_ATTEMPTS",
+      dl_mod2._curl_attempt_budget([("m", f"http://h{i}") for i in range(20)])
+      == dl_mod2.MAX_CURL_QUEUE_ATTEMPTS)
+check("_curl_attempt_budget на короткой очереди = len(mirrors)",
+      dl_mod2._curl_attempt_budget([("a", "u1"), ("b", "u2")]) == 2)
+
+# 11.2 run_curl_queues: budget/truncated + разделение между очередями
+_orig_dqwc = dl_mod2.download_queue_with_curl
+_orig_which = dl_mod2.shutil_which_curl
+_seen_submits = []
+try:
+    dl_mod2.shutil_which_curl = lambda: "/usr/bin/curl"
+    dl_mod2.probe_mirrors_with_curl = lambda m, budget_sec=25: list(m)
+    dl_mod2.download_queue_with_curl = None  # placeholder, см. ниже
+
+    def _fake_dqwc(mirrors, dest, min_bytes=1024, silent=False,
+                   validator=None, max_attempts=None):
+        # эмулируем «сеть рвёт всё»: ничего не скачиваем, помечаем заходы
+        _seen_submits.append((len(mirrors), max_attempts))
+        return None
+
+    dl_mod2.download_queue_with_curl = _fake_dqwc
+    q1 = [(f"jar{i}", f"http://j{i}") for i in range(6)]
+    q2 = [("cdn-exe", "http://cdn/exe")]
+    r = dl_mod2.run_curl_queues([q1, q2], tmp / "nope.bin", min_bytes=1)
+    check("run_curl_queues: budget = min(total, MAX)",
+          r["budget"] == min(7, dl_mod2.MAX_CURL_QUEUE_ATTEMPTS))
+    check("run_curl_queues: без усечения при 7 зеркалах",
+          r["truncated"] is False and r["ok"] is False)
+    # 6+1=7 <= 8: обе очереди прогнаны целиком; хвостовая очередь НЕ съезжает
+    check("run_curl_queues: последняя очередь не обрезается (запасной CDN жив)",
+          _seen_submits and _seen_submits[-1][0] == 1)
+
+    _seen_submits.clear()
+    big = [(f"m{i}", f"http://m{i}") for i in range(12)]
+    r2 = dl_mod2.run_curl_queues([big, big[:3]], tmp / "nope2.bin",
+                                 min_bytes=1)
+    check("run_curl_queues: truncated=True когда зеркал больше бюджета",
+          r2["truncated"] is True and r2["budget"] == 8)
+    total_tries = sum(n for n, _ in _seen_submits)
+    check("run_curl_queues: суммарные заходы не превышают бюджет",
+          total_tries <= 8)
+
+    # allow_full — старое поведение полного перебора
+    _seen_submits.clear()
+    r3 = dl_mod2.run_curl_queues([big], tmp / "nope3.bin", min_bytes=1,
+                                 allow_full=True)
+    check("allow_full=True снимает усечение", r3["truncated"] is False
+          and r3["budget"] == 12)
+finally:
+    dl_mod2.download_queue_with_curl = _orig_dqwc
+    dl_mod2.shutil_which_curl = _orig_which
+
+# 11.3 download_queue_with_curl с validator: .exe вместо .jar ОТВЕРГАЕТСЯ
+# (раньше файл по размеру считался успехом, следующий этап его ломал —
+# и весь круг загрузки повторялся заново: простыня «curl не смог»)
+exe_jar = tmp / "FakeLauncher.jar"
+exe_jar.write_bytes(b"MZ\x90\x00" + b"\x00" * (2 * 1024 * 1024))
+_orig_dlvcurl = dl_mod2.download_via_curl
+_orig_probe = dl_mod2.probe_mirrors_with_curl
+_orig_which2 = dl_mod2.shutil_which_curl
+try:
+    dl_mod2.shutil_which_curl = lambda: "/usr/bin/curl"
+    dl_mod2.probe_mirrors_with_curl = lambda m, budget_sec=25: list(m)
+
+    def _fake_dlvcurl(url, dest, timeout=60, extra=None):
+        # curl «успешно» скачал: MZ-установщик лежит в .jar-файле
+        p = Path(str(dest) + ".part") if str(dest).endswith(".part") \
+            else None
+        tgt = p if (p and p.exists()) else Path(dest)
+        try:
+            tgt.write_bytes(exe_jar.read_bytes())
+            return True
+        except OSError:
+            return False
+
+    dl_mod2.download_via_curl = _fake_dlvcurl
+    got = dl_mod2.download_queue_with_curl(
+        [("mirror1", "http://m1"), ("mirror2", "http://m2")], exe_jar,
+        min_bytes=1024, silent=True, validator=mc._looks_like_jar)
+    check("validator: .exe под видом .jar отклоняется (не success)",
+          got is None)
+    check("отвергнутый мусор удалён с диска", not exe_jar.exists())
+
+    # Тот же файл, но валидатор ждёт MZ (мы просили установщик) — успех.
+    # ВАЖНО: dest переименован в .exe — _downloaded_file_plausible по
+    # расширению .jar требовал бы PK-сигнатуру и честно отверг бы PE-файл.
+    exe_true = tmp / "RealLauncher.exe"
+    exe_true.write_bytes(b"MZ\x90\x00" + b"\x00" * (2 * 1024 * 1024))
+    got2 = dl_mod2.download_queue_with_curl(
+        [("mirrorX", "http://mx")], exe_true, min_bytes=1024, silent=True,
+        validator=mc._is_exe_installer)
+    check("validator: MZ-.exe принимается там, где нужен установщик",
+          got2 == "http://mx")
+    if exe_true.exists():
+        exe_true.unlink()
+    # max_attempts=0 — очередь не гоняется вообще (бюджет исчерпан)
+    got3 = dl_mod2.download_queue_with_curl(
+        [("mirrorY", "http://my")], tmp / "never.bin", min_bytes=1024,
+        silent=True, max_attempts=0)
+    check("max_attempts=0 не делает ни одной попытки", got3 is None)
+finally:
+    dl_mod2.download_via_curl = _orig_dlvcurl
+    dl_mod2.probe_mirrors_with_curl = _orig_probe
+    dl_mod2.shutil_which_curl = _orig_which2
+    try:
+        exe_jar.unlink()
+    except OSError:
+        pass
+
+# 11.4 Хелперы setup_legacy(): кэш .exe по всем браузерным именам
+ledir = tmp / "legacy-portable"
+ledir.mkdir(exist_ok=True)
+big_exe = ledir / "Legacy Launcher Setup.exe"   # имя из браузера
+big_exe.write_bytes(b"MZ" + b"\x00" * (3 * 1024 * 1024))
+check("_exe_cached_ok видит установщик, сохранённый браузером",
+      mc._exe_cached_ok(ledir))
+check("_exe_cached_path возвращает реальное имя файла",
+      mc._exe_cached_path(ledir) == big_exe)
+small = ledir / "LegacyLauncher-setup.exe"
+small.write_bytes(b"MZ\x00\x00tiny")
+check("_exe_size_ok отвергает огрызок (<2 МБ)", not mc._exe_size_ok(small))
+big_exe.unlink()
+good_jar = ledir / "LegacyLauncher.jar"
+good_jar.write_bytes(b"PK\x03\x04" + b"\x00" * (2 * 1024 * 1024))
+check("_cached_jar_ok принимает настоящий PK-.jar", mc._cached_jar_ok(good_jar))
+good_jar.write_bytes(b"<html>blocked</html>" * 100000)
+check("_cached_jar_ok отвергает HTML-заглушку фильтра",
+      not mc._cached_jar_ok(good_jar))
+
+# 11.5 _legacy_exe_fallback: уже скачанный установщик НЕ перекачивается
+ledir2 = tmp / "lp2"
+ledir2.mkdir(exist_ok=True)
+exe_p = ledir2 / "LegacyLauncher-setup.exe"
+exe_p.write_bytes(b"MZ" + b"\x00" * (3 * 1024 * 1024))
+_called = {"n": 0}
+try:
+    dl_mod2.download_queue_with_curl = \
+        lambda *a, **k: _called.__setitem__("n", _called["n"] + 1) or None
+    check("fallback: кэш .exe найден — сеть не трогается",
+          mc._legacy_exe_fallback(exe_p, [("cdn", "http://cdn")]) is True
+          and _called["n"] == 0)
+    exe_p.unlink()
+    check("fallback: без кэша делает ровно одну curl-очередь",
+          mc._legacy_exe_fallback(exe_p, [("cdn", "http://cdn")]) is False
+          and _called["n"] == 1)
+finally:
+    dl_mod2.download_queue_with_curl = _orig_dqwc
+
+# 11.6 setup_legacy(): Windows-ветка делает ОДИН curl-прогон (не три круга).
+# Проверяем исходник функции статически: форсировать IS_WINDOWS нельзя —
+# `from ... import IS_WINDOWS` связан при импорте модуля.
+seg_src = open(ROOT / "modules" / "minecraft.py", encoding="utf-8").read()
+i0 = seg_src.index("def setup_legacy():")
+i1 = seg_src.index("# ═", i0 + 10)
+seg = seg_src[i0:i1]
+check("setup_legacy: единая точка curl-загрузки (_legacy_curl_once)",
+      "_legacy_curl_once(cand, exe_cand)" in seg
+      and "download_queue_with_curl(" not in seg)
+check("setup_legacy: второй полный круг jar-зеркал убран "
+      "(нет повторного legacy_jar_mirrors внутри)",
+      seg.count("legacy_jar_mirrors") == 0)
+check("setup_legacy: .exe-запасной путь идёт через _legacy_exe_fallback "
+      "(кэш не перекачивается)",
+      "_legacy_exe_fallback(exe_path, exe_queue)" in seg
+      and "download_via_curl" not in seg)
+check("_legacy_curl_once передаёт оба списка очередей в run_curl_queues",
+      "run_curl_queues([legacy_jar_mirrors(True)," in seg_src)
+
 print()
 if fails:
     print(f"ПРОВАЛОВ: {len(fails)} -> {fails}")

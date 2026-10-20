@@ -1036,7 +1036,132 @@ def probe_mirrors_with_curl(mirrors, budget_sec=25):
     return alive + dead
 
 
-def download_queue_with_curl(mirrors, dest, min_bytes=1024, silent=False):
+#: Ограничитель длины очереди сетевых попыток внутри одной команды.
+#: Каждый заход на мёртвое/блокируемое зеркало стоит десятки секунд
+#: (connect-timeout + ретраи TLS-фиксов), а в школьной сети RST/сброс
+#: прилетает ВСЕМ доменам сразу. Без лимита одна команда `legacy`
+#: превращалась в два подряд полных круга по всем зеркалам (~7 минут
+#: молчания с простынёй ошибок) — см. legacy_try_queues().
+MAX_CURL_QUEUE_ATTEMPTS = 8
+
+
+def _curl_attempt_budget(mirrors):
+    """Сколько curl-заходов реально имеет смысл сделать для этой очереди."""
+    return min(len(mirrors), MAX_CURL_QUEUE_ATTEMPTS)
+
+
+def run_curl_queues(queues, dest, min_bytes=1024,
+                    validator=None, silent=False, allow_full=False):
+    """Прогоняет curl.exe по НЕСКОЛЬКИМ очередям зеркал с общим лимитом.
+
+    Лечит симптом «legacy качается бесконечно»: у Legacy Launcher две
+    очереди (.jar-portable и .exe-установщик), и раньше они исполнялись
+    ДРУГ ЗА ДРУГОМ целиком. В сети, которая рвёт все домены лаунчера
+    (curl rc=35 + WinError 10054), это два полных круга по 6~8 зеркалам
+    с таймаутами и TLS-ретраями — сотни секунд простыни «curl не смог»,
+    после которых всё равно предлагалось ручное скачивание. Здесь общий
+    бюджет попыток (MAX_CURL_QUEUE_ATTEMPTS) делится между очередями:
+    первые заходы — в основной очереди, остаток — в запасной; лишние
+    заходы НЕ выполняются, но живой файл находится так же быстро.
+
+    queues    — список очередей, каждая [(имя, url), ...]; пустые — ок;
+    validator — вызываемый валидатор скачанного файла (например
+                _looks_like_jar); без него достаточно размера;
+    silent    — не печатать прогресс.
+    Возвращает dict-резюме: {"ok": bool, "url": str|None, "attempts": int,
+    "budget": int, "truncated": bool, "mirrors_total": int}.
+    """
+    cleaned = [list(q) for q in queues if q]
+    total = sum(len(q) for q in cleaned)
+    # allow_full=True — поведение «как раньше»: каждая очередь прогоняется
+    # целиком (для мест, где одна очередь уже является полным перебором и
+    # второй круга всё равно нет). По умолчанию — жёсткий общий бюджет.
+    budget = total if allow_full else min(total, MAX_CURL_QUEUE_ATTEMPTS)
+    resume = {"ok": False, "url": None, "attempts": 0, "budget": budget,
+              "truncated": budget < total, "mirrors_total": total}
+    if not cleaned or budget <= 0:
+        return resume
+
+    def _valid(p):
+        try:
+            if not p.exists() or p.stat().st_size < max(min_bytes, 1024):
+                return False
+            if validator is not None:
+                return bool(validator(p))
+            return _downloaded_file_plausible(p)
+        except OSError:
+            return False
+
+    exe = shutil_which_curl()
+    per_queue = max(budget // len(cleaned), 1) if len(cleaned) > 1 else budget
+    spent = 0
+    for qi, queue in enumerate(cleaned):
+        remaining = budget - spent
+        if remaining <= 0:
+            break
+        # Хвост очереди не режем: запасное зеркало (например Yandex CDN,
+        # отдающий .exe-установщик) обычно стоит последним элементом, и
+        # обрезка по per_queue выбрасывала именно его — «запасной путь»
+        # молча исчезал. Последняя очередь берётся вся, но упирается в
+        # оставшийся бюджет внутри download_queue_with_curl.
+        take = len(queue) if qi == len(cleaned) - 1 \
+            else min(len(queue), per_queue)
+        sub = queue[:take]
+        if exe:
+            got = download_queue_with_curl(sub, dest, min_bytes=min_bytes,
+                                           validator=validator,
+                                           silent=silent,
+                                           max_attempts=remaining)
+            spent += _curl_attempt_budget(sub)
+        else:
+            # curl.exe нет (Windows < 1803 или вырезан) — тот же обход
+            # очередей штатным urllib (open_checked умеет raw-сокет).
+            got = _python_queue_fallback(sub, dest, min_bytes, validator,
+                                         silent)
+            spent += len(sub)
+        if got:
+            resume.update(ok=True, url=got, attempts=spent)
+            return resume
+    resume["attempts"] = spent
+    return resume
+
+
+def _python_queue_fallback(mirrors, dest, min_bytes, validator, silent):
+    """Закачка очереди зеркал чистым Python (когда curl.exe недоступен)."""
+    for name, url in mirrors:
+        if not silent:
+            info(f"Пробую закачку через Python: {CYAN}{name}{RESET}")
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": CURL_BROWSER_UA})
+            r = open_checked(req, CONNECT_TIMEOUT)
+        except Exception as e:
+            debug.dbg(f"python-fallback {name}: {e}", level="WARN")
+            if not silent:
+                err(f"  Не подключиться: {e}")
+            continue
+        try:
+            if not save_response(r, dest, name, silent=silent):
+                continue
+        finally:
+            try:
+                r.close()
+            except Exception:
+                pass
+        try:
+            if dest.stat().st_size >= max(min_bytes, 1024) \
+                    and (validator(dest) if validator
+                         else _downloaded_file_plausible(dest)):
+                ok(f"  Готово (Python): "
+                   f"{dest.stat().st_size / 1024 / 1024:.1f} МБ")
+                return url
+        except OSError:
+            pass
+    return None
+
+
+def download_queue_with_curl(mirrors, dest, min_bytes=1024, silent=False,
+                             validator=None, max_attempts=None):
     """Прогоняет curl.exe по ВСЕЙ очереди зеркал.
 
     В школьных сетях DPI рвёт TLS-рукопожатие Python (WinError 10054) на
@@ -1051,11 +1176,25 @@ def download_queue_with_curl(mirrors, dest, min_bytes=1024, silent=False):
     Затем очередь переупорядочивается быстрым HEAD-пробом
     (probe_mirrors_with_curl), чтобы зависшее зеркало не блокировалось
     долгими таймаутами раньше живого.
+
+    validator   — дополнительная проверка содержимого скачанного файла
+                  (например _looks_like_jar для Legacy .jar). Раньше
+                  считалось достаточным «размер >= min_bytes», поэтому
+                  официальный CDN, отдающий вместо portable .jar свой
+                  .exe-установщик, проходил как успех, а следующий этап
+                  (_looks_like_jar) этот файл отвергал — и весь круг
+                  загрузки повторялся заново уже другим кодом. Теперь
+                  неподходящий файл честно помечается неверным и очередь
+                  продолжается/завершается сразу.
+    max_attempts — сколько зеркал успеть прогнать (бюджет времени;
+                  см. run_curl_queues).
     """
     if not shutil_which_curl():
         return None
     warn_if_windows_proxy()
     mirrors = probe_mirrors_with_curl(mirrors)
+    if max_attempts is not None:
+        mirrors = mirrors[:max(max_attempts, 0)]
     for name, url in mirrors:
         try:
             if dest.exists() and dest.stat().st_size >= max(min_bytes, 1024):
@@ -1063,7 +1202,9 @@ def download_queue_with_curl(mirrors, dest, min_bytes=1024, silent=False):
                 # gh-proxy-зеркала это означало: HTML-заглушка > min_bytes
                 # засчитывалась скачанной, и Prism «успешно устанавливался»
                 # битым. Проверяем содержимое; мусор удаляем и идём дальше.
-                if _downloaded_file_plausible(dest):
+                content_ok = (_downloaded_file_plausible(dest)
+                              and (validator(dest) if validator else True))
+                if content_ok:
                     return url
                 warn(f"  {name}: в кэше мусор (HTML/битый архив), "
                      f"перекачиваю")
@@ -1080,6 +1221,18 @@ def download_queue_with_curl(mirrors, dest, min_bytes=1024, silent=False):
                               extra=_tls_fix_cache.get(url)):
             try:
                 if dest.stat().st_size >= max(min_bytes, 1024):
+                    if validator is not None and not validator(dest):
+                        # Формально скачалось, но это НЕ тот артефакт,
+                        # который мы просили (CDN отдал .exe вместо .jar).
+                        # Молча возвращать успех нельзя — следующий этап
+                        # отвергнет файл и качает всё по кругу.
+                        warn("  curl скачал файл, но он не проходит "
+                             f"проверку содержимого ({name}) — пропускаю")
+                        try:
+                            dest.unlink()
+                        except OSError:
+                            pass
+                        continue
                     ok(f"  Готово (curl): "
                        f"{dest.stat().st_size / 1024 / 1024:.1f} МБ")
                     return url
