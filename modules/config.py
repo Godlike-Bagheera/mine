@@ -328,23 +328,28 @@ LEGACY_MIRRORS = [
      "https://archive.org/download/legacy-launcher-for-minecraft/LegacyLauncher_Installer_legacy.exe"),
 ]
 
+_PRISM_WIN_BASE = ("https://github.com/PrismLauncher/PrismLauncher/releases/"
+                   "download/11.1.1")
+
+# Portable .zip — основная сборка для Windows. В Setup .exe и MinGW/w64
+# сборках Qt ICU-библиотеки (icu.dll / icuuc.dll) НЕ включены в пакет —
+# при запуске prismlauncher.exe Windows выдаёт «Не удается продолжить
+# выполнение кода, поскольку система не обнаружила icu.DLL». Только в
+# MSVC-Portable zip лежат icu*.dll рядом с exe.
+PRISM_WIN_ZIP_NAME = "PrismLauncher-Windows-MSVC-Portable-11.1.1.zip"
+PRISM_WIN_ZIP_URL = f"{_PRISM_WIN_BASE}/{PRISM_WIN_ZIP_NAME}"
 PRISM_WIN_URLS = [
-    ("GitHub (прямой)",
-     "https://github.com/PrismLauncher/PrismLauncher/releases/download/"
-     "11.1.1/PrismLauncher-Windows-MSVC-Setup-11.1.1.exe"),
-    ("ghfast.top",
-     "https://ghfast.top/https://github.com/PrismLauncher/PrismLauncher/releases/download/"
-     "11.1.1/PrismLauncher-Windows-MSVC-Setup-11.1.1.exe"),
-    ("ghproxy.net",
-     "https://ghproxy.net/https://github.com/PrismLauncher/PrismLauncher/releases/download/"
-     "11.1.1/PrismLauncher-Windows-MSVC-Setup-11.1.1.exe"),
-    ("gh.llkk.cc",
-     "https://gh.llkk.cc/https://github.com/PrismLauncher/PrismLauncher/releases/download/"
-     "11.1.1/PrismLauncher-Windows-MSVC-Setup-11.1.1.exe"),
-    ("gh-proxy.com",
-     "https://gh-proxy.com/https://github.com/PrismLauncher/PrismLauncher/releases/download/"
-     "11.1.1/PrismLauncher-Windows-MSVC-Setup-11.1.1.exe"),
+    ("GitHub (прямой)", PRISM_WIN_ZIP_URL),
+    ("ghfast.top", f"https://ghfast.top/{PRISM_WIN_ZIP_URL}"),
+    ("ghproxy.net", f"https://ghproxy.net/{PRISM_WIN_ZIP_URL}"),
+    ("gh.llkk.cc", f"https://gh.llkk.cc/{PRISM_WIN_ZIP_URL}"),
+    ("gh-proxy.com", f"https://gh-proxy.com/{PRISM_WIN_ZIP_URL}"),
 ]
+
+# Запасной вариант: официальный установщик от разработчиков (Qt из их
+# репозитория, icu.dll ставит сам). Качается через браузер, если
+# автоматическая загрузка блокируется сетью.
+PRISM_WIN_OFFICIAL_PAGE = "https://prismlauncher.org/downloads/"
 
 LEGACY_URL = LEGACY_MIRRORS[0][1]
 
