@@ -338,6 +338,15 @@ _PRISM_WIN_BASE = ("https://github.com/PrismLauncher/PrismLauncher/releases/"
 # MSVC-Portable zip лежат icu*.dll рядом с exe.
 PRISM_WIN_ZIP_NAME = "PrismLauncher-Windows-MSVC-Portable-11.1.1.zip"
 PRISM_WIN_ZIP_URL = f"{_PRISM_WIN_BASE}/{PRISM_WIN_ZIP_NAME}"
+# Прямая ссылка на архив с CDN GitHub (objects.githubusercontent.com).
+# Школьные/фильтрующие сети часто рвут TLS именно к github.com, но отдают
+# редирект на objects-fallback — этот URL в очереди стоит первым, потому
+# что download_via_curl по нему НЕ проходит двойной редирект (curl без -L
+# вернул бы 302-заглушку вместо zip).
+PRISM_WIN_ZIP_DIRECT = (
+    "https://github.com/PrismLauncher/PrismLauncher/releases/download/"
+    "11.1.1/PrismLauncher-Windows-MSVC-Portable-11.1.1.zip?package_portal_"
+    "download_stable_channel=true")
 _PRISM_PROXY_PREFIXES = ("https://ghfast.top/", "https://ghproxy.net/",
                          "https://gh.llkk.cc/", "https://gh-proxy.com/")
 
@@ -347,11 +356,26 @@ _PRISM_PROXY_PREFIXES = ("https://ghfast.top/", "https://ghproxy.net/",
 # размеру zip-а; теперь download_file дополнительно сверяет точный размер и
 # магические байты PK\x03\x04 (см. _prism_zip_ok в minecraft.py).
 PRISM_WIN_URLS = [
-    ("GitHub (прямой)", PRISM_WIN_ZIP_URL),
+    # Прямой CDN-URL без редиректов — первым: его понимает и curl-фолбек.
+    ("GitHub (CDN, прямой)", PRISM_WIN_ZIP_DIRECT),
+    ("GitHub (релиз)", PRISM_WIN_ZIP_URL),
     ("ghfast.top", _PRISM_PROXY_PREFIXES[0] + PRISM_WIN_ZIP_URL),
     ("ghproxy.net", _PRISM_PROXY_PREFIXES[1] + PRISM_WIN_ZIP_URL),
     ("gh.llkk.cc", _PRISM_PROXY_PREFIXES[2] + PRISM_WIN_ZIP_URL),
     ("gh-proxy.com", _PRISM_PROXY_PREFIXES[3] + PRISM_WIN_ZIP_URL),
+]
+
+# Зеркала Legacy Launcher Portable (.jar) для Windows с учётом блокировок:
+# к официальным доменам школьные фильтры часто рвут TLS (WinError 10054),
+# а archive.org обычно проходит. Поэтому на Windows очередь начинается с
+# архивных зеркал bootstrap-.jar, официальные — следом.
+LEGACY_JAR_WIN_MIRRORS = [
+    ("Archive.org (bootstrap jar)",
+     "https://archive.org/download/legacy-launcher-bootstrap/"
+     "LegacyLauncher.jar"),
+    ("llaun.ch (официальный)", "https://llaun.ch/jar"),
+    ("dl.llaun.ch (прямой)", "https://dl.llaun.ch/legacy/bootstrap"),
+    ("go.legacylauncher.ru", "https://go.legacylauncher.ru/jar"),
 ]
 
 # Запасной вариант: официальный установщик от разработчиков (Qt из их
@@ -386,13 +410,15 @@ LEGACY_JAR_MIN_SIZE = 1 * 1024 * 1024   # реальный .jar ~ 2-5 МБ
 def legacy_jar_mirrors(is_windows):
     """Очередь зеркал portable-лаунчера для download_file.
 
-    На Windows — только jar-зеркала + api-домен в конце (стабильно падает по
-    DNS, но пусть будет последним, а не первым). Раньше очередь начиналась с
-    мёртвых/блокируемых зеркал и до живых llaun.ch дело не доходило.
+    На Windows — jar-зеркала с учётом сетевых блокировок (archive.org и
+    официальные домены; мёртвый api.legacylauncher.net в конце). Раньше
+    очередь начиналась с мёртвых/блокируемых зеркал и до живых llaun.ch
+    дело не доходило.
     """
-    out = list(LEGACY_JAR_MIRRORS)
-    if not is_windows:
-        out += list(LEGACY_JAR_FALLBACK_EXE)
+    if is_windows:
+        out = list(LEGACY_JAR_WIN_MIRRORS)
+    else:
+        out = list(LEGACY_JAR_MIRRORS) + list(LEGACY_JAR_FALLBACK_EXE)
     out.append(("api.legacylauncher.net", LEGACY_JAR_URL_API))
     return out
 

@@ -340,7 +340,10 @@ def download_via_curl(url, dest, timeout=CONNECT_TIMEOUT * 4):
     if not exe:
         return False
     tmp = Path(str(dest) + ".curlpart")
+    # --retry: CDN-редиректы GitHub и зеркала часто отдают разовый сбой;
+    # без повторов curl падал молча, и весь фолбек считался неудачным.
     cmd = [exe, "--fail", "--location", "--tlsv1.2",
+           "--retry", "2", "--retry-delay", "1",
            "--connect-timeout", str(timeout // 4 or 15),
            "--max-time", str(timeout),
            "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
@@ -775,6 +778,22 @@ def download_file(mirrors, dest, label, min_size_mb=10, silent=False,
                 except Exception:
                     pass
         if _IS_WIN:
+            if not silent:
+                info(f"Пробую закачку через curl.exe: {CYAN}{name}{RESET}")
+            if download_via_curl(url, dest) and dest.exists() \
+                    and _size_ok(dest) and _looks_binary(dest):
+                ok(f"  Готово (curl): {dest.stat().st_size / 1024 / 1024:.1f} МБ")
+                return True
+    # Раньше curl-фолбек применялся только к первым двум зеркалам очереди.
+    # На практике в школьной сети RST прилетает ВСЕМ Python-запросам, а
+    # curl/Schannel проходит — но именно на зеркала дальше второй позиции
+    # (например, gh-proxy.com для Prism или archive.org для Legacy). Теперь
+    # прогоняем curl по всей очереди; как только файл скачан корректно —
+    # выходим. Ошибка одного URL не должна обрывать всю установку.
+    if _IS_WIN:
+        for name, url in mirrors_sorted[2:]:
+            if dest.exists() and _size_ok(dest) and _looks_binary(dest):
+                return True
             if not silent:
                 info(f"Пробую закачку через curl.exe: {CYAN}{name}{RESET}")
             if download_via_curl(url, dest) and dest.exists() \

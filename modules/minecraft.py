@@ -706,6 +706,16 @@ def setup_legacy_portable():
             "Legacy Launcher Portable",
             min_size_mb=1, silent=False,
         )
+        if not downloaded:
+            # download_file при RST на всех Python-запросах оставляет на
+            # диске битые огрызки (HTML-заглушки фильтров, 302-страницы).
+            # Они НЕ проходят _looks_like_jar в _find_local_legacy_jar, но
+            # мешают повторной закачке — чистим.
+            try:
+                if jar_path.exists() and not _looks_like_jar(jar_path):
+                    jar_path.unlink()
+            except OSError as e:
+                debug.dbg_exc(e, "setup_legacy/unlink-bad")
         if downloaded:
             ok(f"Скачано: {jar_path}")
         else:
@@ -726,6 +736,8 @@ def setup_legacy_portable():
                 debug.dbg(f"clipboard: {e}", level="WARN")
             _open_legacy_manual_page()
             print()
+            hint("Если браузер уже что-то скачал — просто нажми Enter ещё раз")
+            hint("после окончания загрузки: команда `legacy` сама найдёт файл.")
             # Возможно, браузер уже успел скачать файл (или качал раньше) —
             # ищем сам: не придётся ничего вводить руками.
             found = _find_local_legacy_jar()
