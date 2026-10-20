@@ -18,13 +18,54 @@ echo  [MC Installer] Bootstrap для Windows 10...
 echo.
 
 REM ---------- ищем Python ----------
+REM ВАЖНО: где-то в PATH может лежать алиас python.exe из Microsoft Store,
+REM который ничего не делает, а лишь открывает магазин и мгновенно завершается
+REM с кодом 9009 — из-за этого окно закрывалось за долю секунды ("запускается и
+REM сразу закрывается"). Поэтому проверяем каждый кандидат реальным запуском.
 set "PY="
-where py >nul 2>nul && set "PY=py -3"
-if not defined PY where python >nul 2>nul && set "PY=python"
+
+REM 1) launcher "py" — самый надёжный способ на Windows 10
+py -3 -c "print(1)" >nul 2>nul
+if not errorlevel 1 set "PY=py -3"
+
+REM 2) python / python3 из PATH (исключая пустые aliасы Microsoft Store)
 if not defined PY (
-    echo  [!] Python не найден. Пробую поставить через winget...
+    for %%P in (python python3) do (
+        if not defined PY (
+            where %%P >nul 2>nul
+            if not errorlevel 1 (
+                %%P -c "print(1)" >nul 2>nul
+                if not errorlevel 1 set "PY=%%P"
+            )
+        )
+    )
+)
+
+REM 3) ищем настоящую установку Python в типовых папках
+if not defined PY (
+    for /d %%V in ("%LOCALAPPDATA%\Programs\Python\Python*") do (
+        if exist "%%V\python.exe" (
+            "%%V\python.exe" -c "print(1)" >nul 2>nul
+            if not errorlevel 1 if not defined PY set "PY=%%V\python.exe"
+        )
+    )
+)
+if not defined PY (
+    for /d %%V in ("C:\Python*" "C:\Program Files\Python*") do (
+        if exist "%%V\python.exe" (
+            "%%V\python.exe" -c "print(1)" >nul 2>nul
+            if not errorlevel 1 if not defined PY set "PY=%%V\python.exe"
+        )
+    )
+)
+
+if not defined PY (
+    echo  [!] Python не найден ^(или это заглушка Microsoft Store^).
+    echo      Пробую поставить через winget...
     winget install -e --id Python.Python.3.12 --accept-package-agreements --accept-source-agreements
-    where python >nul 2>nul && set "PY=python"
+    py -3 -c "print(1)" >nul 2>nul
+    if not errorlevel 1 set "PY=py -3"
+    if not defined PY where python >nul 2>nul && set "PY=python"
 )
 if not defined PY (
     echo  [X] Не удалось найти или установить Python.
@@ -39,6 +80,10 @@ where git >nul 2>nul
 if %ERRORLEVEL%==0 (
     if exist "%DEST%\.git" (
         echo  [..] Обновляю существующую копию через git pull...
+        REM Если в локальной копии есть незакоммиченные правки — не даём им
+        REM блокировать pull (раньше из-за этого pull падал и скрипт мог
+        REM закрыться, не дойдя до запуска).
+        git -C "%DEST%" stash -q >nul 2>nul
         git -C "%DEST%" pull --ff-only
     ) else (
         echo  [..] Клонирую репозиторий через git...
@@ -73,5 +118,12 @@ if not exist "%DEST%\launcher.py" (
 echo  [OK] Запускаю установщик...
 echo.
 %PY% "%DEST%\launcher.py" %**
-if errorlevel 1 pause
+set "RC=%ERRORLEVEL%"
+REM ВСЕГДА держим окно открытым после завершения (иначе при любом козе или
+REM быстром выходе пользователь видит только мелькнувшее окно и всё).
+if not "%RC%"=="0" echo.
+if not "%RC%"=="0" echo  [i] Код выхода: %RC%
+echo.
+pause
 endlocal
+exit /b %RC%
