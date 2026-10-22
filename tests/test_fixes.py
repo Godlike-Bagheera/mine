@@ -652,6 +652,17 @@ def _tl_df_ok(mirrors, dest, label, **kw):
     return True
 
 
+# Очередь строится динамически: wildcard-зеркало всегда живёт в очереди
+# (рабочий endpoint последнего стабильного jar); версионированный шаблон —
+# только если API отдал версию. Эталон очереди собираем так же.
+_wild = next(u for _n, u in cfg.TLAUNCHER_API_URLS if "*" in u.split("/")[-1])
+_tmpl = next((u for _n, u in cfg.TLAUNCHER_API_URLS if "{VERSION}" in u), None)
+_ver = mc_mod._tlauncher_latest_version()
+exp_queue = []
+if _ver and _tmpl:
+    exp_queue.append(_tmpl.replace("{VERSION}", _ver))
+exp_queue.append(_wild)
+
 dest_tl = tmp / "tl-dl" / cfg.TLAUNCHER_JAR_NAME
 _orig_dwc = dl_mod.download_with_curl
 _orig_df_tl = mc_mod.download_file
@@ -661,8 +672,8 @@ try:
     got = mc_mod._download_tlauncher_jar(dest_tl)
     check("_download_tlauncher_jar: при отказе прямого curl качает "
           "по ЕДИНОЙ очереди зеркал TLAUNCHER_API_URLS",
-          got is not None and seen_tl["curl"] == [cfg.TLAUNCHER_API_URLS[0][1]]
-          and seen_tl["df"][0] == [u for _n, u in cfg.TLAUNCHER_API_URLS])
+          got is not None and seen_tl["curl"] == exp_queue
+          and seen_tl["df"][0] == exp_queue)
     dest_tl.unlink()
 
     # Прямой curl успешен → зеркала вообще не трогаются

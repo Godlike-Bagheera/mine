@@ -14,7 +14,8 @@ from modules.colors import ok, info, warn, err, hint, CYAN, YELLOW, MAGENTA, BOL
 from modules.config import (
     WINE_DIR, PRISM_DIR, PRISM_URL, WINE_PREFIX,
     FO_GITHUB_API, OPTIFINE_PAGE, FABRIC_META, FABRIC_MAVEN,
-    MOJANG_VERSION_MANIFEST, make_github_mirrors,
+    MOJANG_VERSION_MANIFEST,
+    mojang_url, make_github_mirrors,
     LEGACY_JAR_MIN_SIZE, legacy_jar_mirrors,
     SYSTEM_TRUSTSTORE_PATHS, SYSTEM_TRUSTSTORE_PASSWORD,
     FABRIC_META_API, MAVEN_FABRIC, MAVEN_CENTRAL,
@@ -29,7 +30,7 @@ from modules.config import (
 
     LEGACY_MANUAL_PAGE, LEGACY_MANUAL_JAR_URL,
     TLAUNCHER_DIR_NAME, TLAUNCHER_JAR_NAME, TLAUNCHER_MANUAL_PAGE,
-    TLAUNCHER_API_URLS, TLAUNCHER_MIN_SIZE,
+    TLAUNCHER_API_URLS, TLAUNCHER_MIN_SIZE, TLAUNCHER_VERSIONS_API,
     TLAUNCHER_FALLBACK_PAGE,)
 from modules import net
 from modules.download import download_file, head_check
@@ -49,10 +50,30 @@ def _http_get(url, timeout=30, headers=None):
 
 
 def _http_get_json(url, timeout=30):
-    """GET url -> распарсенный JSON (SSL-контекст как в остальном проекте)."""
-    with _http_get(url, timeout=timeout,
-                   headers={"User-Agent": "wine-installer/2.5"}) as r:
-        return json.loads(r.read().decode("utf-8", errors="replace"))
+    """GET url -> распарсенный JSON (SSL-контекст как в остальном проекте).
+
+    Для доменов Mojang meta (launchermeta.mojang.com) при сбое делает
+    запасной заход на зеркало piston-meta.mojang.com — тот же путь, живой
+    IP (в РФ launchermeta часто перехвачен/заблокирован системным DNS,
+    см. netcheck).
+    """
+    try:
+        with _http_get(url, timeout=timeout,
+                       headers={"User-Agent": "wine-installer/2.5"}) as r:
+            return json.loads(r.read().decode("utf-8", errors="replace"))
+    except Exception as first_err:
+        alt = None
+        if "launchermeta.mojang.com" in url:
+            alt = url.replace("launchermeta.mojang.com", "piston-meta.mojang.com")
+        elif "piston-meta.mojang.com" in url:
+            alt = url.replace("piston-meta.mojang.com", "launchermeta.mojang.com")
+        if alt and alt != url:
+            debug.dbg(f"_http_get_json: {url} упал ({first_err}), пробую зеркало {alt}",
+                      level="WARN")
+            with _http_get(alt, timeout=timeout,
+                           headers={"User-Agent": "wine-installer/2.5"}) as r:
+                return json.loads(r.read().decode("utf-8", errors="replace"))
+        raise
 
 
 def _github_get_json(url, timeout=30):
@@ -636,9 +657,14 @@ def setup_prism():
                                                  min_size_mb=10,
                                                  exact_size=prism_exact):
             err("Не удалось скачать Prism Launcher для Windows")
-            hint("Скачай вручную через браузер: https://prismlauncher.org/downloads/")
-            hint('выбери вариант "Portable (.zip)" (не "Installer"), например')
-            hint(f"  {PRISM_WIN_ZIP_NAME}")
+            # prismlauncher.org в РФ часто недоступен (DNS-перехват) —
+            # даём прямую ссылку на GitHub Releases: она работает и без
+            # сайта, а скачанный в «Загрузки» архив команда `prism` найдёт сам.
+            from modules.config import PRISM_WIN_ZIP_URL as _pwu
+            hint("Скачай архив напрямую со страницы релизов GitHub:")
+            hint(f"  {_pwu}")
+            hint('нужен вариант "Portable (.zip)" MinGW-w64 (не "Installer"),')
+            hint(f"например {PRISM_WIN_ZIP_NAME}")
             hint("и сохрани в папку Загрузки — команда `prism` найдёт его сам,")
             hint("либо распакуй архив целиком в:")
             hint(f"  {PRISM_DIR}")
@@ -885,16 +911,20 @@ def _open_legacy_manual_page():
     return False
 
 
-def _legacy_dns_hosts_props():
+def _launcher_dns_hosts_props(extra_domains=()):
     """Список -Dсвойств Java, обходящих перехват системного DNS (Windows).
 
-    Legacy Launcher пишет «проверьте подключение к Интернету», когда его
+    Legacy/TLauncher пишет «проверьте подключение к Интернету», когда их
     собственный резолвер получает заглушку фильтра (launchermeta.mojang.com
     и т.п.), хотя браузер тот же сайт открывает. Сменить DNS JVM из скрипта
     нельзя — но можно подменить имена через -Djdk.net.hosts.file: файл со
     списком host=ip, который мы собираем прямым DNS-запросом к публичным
     серверам (77.88.8.8/8.8.8.8) — там перехвата нет. Возвращает [] если
     собирать нечего (не Windows / всё резолвится честно / ошибок).
+
+    extra_domains — домены конкретного лаунчера (для TLauncher это
+    tlauncher.org / api.tlauncher.org): без них bootstrap считает сеть
+    мёртвой и не докачивает ядро.
     """
     from modules.platform_utils import IS_WINDOWS as _IS_WIN
     if not _IS_WIN:
@@ -902,7 +932,9 @@ def _legacy_dns_hosts_props():
     try:
         from modules.download import (resolve_dns, diagnose_dns,
                                       NETCHECK_DOMAINS)
-        res = diagnose_dns(NETCHECK_DOMAINS[:6])
+        domains = list(NETCHECK_DOMAINS[:6]) + [d for d in extra_domains
+                                                if d not in NETCHECK_DOMAINS]
+        res = diagnose_dns(domains)
         blocked = [d for d, r in res.items() if r["verdict"] == "dns_block"]
         if not blocked:
             return []
@@ -916,15 +948,15 @@ def _legacy_dns_hosts_props():
         hosts_file = WINE_DIR / "legacy-portable" / "ll-hosts.properties"
         hosts_file.parent.mkdir(parents=True, exist_ok=True)
         hosts_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        debug.dbg(f"_legacy_dns_hosts_props: {lines}")
+        debug.dbg(f"_launcher_dns_hosts_props: {lines}")
         return [f"-Djdk.net.hosts.file={hosts_file}",
                 "-Djava.net.preferIPv4Stack=true"]
     except Exception as e:
-        debug.dbg(f"_legacy_dns_hosts_props: {e}", level="WARN")
+        debug.dbg(f"_launcher_dns_hosts_props: {e}", level="WARN")
         return []
 
 
-def _run_legacy_jar(jar_path):
+def _run_legacy_jar(jar_path, extra_hosts_domains=()):
     """Запуск portable .jar через найденную Java (без Wine).
 
     На Windows — detached-запуск (javaw), терминал не блокируется.
@@ -933,7 +965,8 @@ def _run_legacy_jar(jar_path):
     `Error: Could not find or load main class .net.ssl.trustStoreType...`).
     Дополнительно: при DNS-перехвате провайдером передаём JVM файл подмены
     hosts (-Djdk.net.hosts.file) — лаунчер перестаёт видеть заглушки
-    фильтра по launchermeta.mojang.com и прочим.
+    фильтра по launchermeta.mojang.com и прочим. extra_hosts_domains —
+    домены конкретного лаунчера (TLauncher), тоже включаются в обход.
     Возвращает True, если процесс реально стартовал; иначе понятное
     сообщение и False (пользователь сможет запустить jar двойным кликом).
     """
@@ -967,7 +1000,7 @@ def _run_legacy_jar(jar_path):
             # Системное хранилище Windows (корни Минцифры) — штатный
             # механизм доверия JVM на этой платформе.
             opts.append("-Djavax.net.ssl.trustStoreType=Windows-ROOT")
-            opts += _legacy_dns_hosts_props()
+            opts += _launcher_dns_hosts_props(extra_hosts_domains)
         exe = java_bin
         if _IS_WIN:
             # javaw.exe — окно лаунчера без чёрной консоли; если рядом его
@@ -1334,19 +1367,90 @@ def _find_local_tlauncher_jar():
     return None
 
 
+def _tlauncher_latest_version():
+    """Определяет актуальную версию bootstrap .jar TLauncher.
+
+    1) официальный update-check API (api.tlauncher.org/update/packages/stable);
+    2) парсинг главной страницы tlauncher.org («TLauncher-2.xx.x»);
+    3) None — тогда используются статические URL из TLAUNCHER_API_URLS.
+    """
+    import re as _re
+    # 1. Update-check API: JSON со списком пакетов, берём максимальный TLauncher-*
+    try:
+        data = _http_get_json(TLAUNCHER_VERSIONS_API, timeout=15)
+        names = []
+        items = data if isinstance(data, list) else \
+            [data.get("version", "")] if isinstance(data, dict) else []
+        for it in items:
+            s = it if isinstance(it, str) else json.dumps(it)
+            names += _re.findall(r"TLauncher-(\d+(?:\.\d+){1,3})", s)
+        if names:
+            v = max(names, key=_ver_tuple)
+            debug.dbg(f"_tlauncher_latest_version api -> {v}")
+            return v
+    except Exception as e:
+        debug.dbg(f"_tlauncher_latest_version api: {e}", level="WARN")
+    # 2. HTML главной страницы (упоминает текущую версию в ссылках/тексте)
+    try:
+        from modules.download import open_checked
+        req = urllib.request.Request(
+            "https://tlauncher.org/",
+            headers={"User-Agent": "Mozilla/5.0"})
+        with open_checked(req, timeout=15) as r:
+            html = r.read().decode("utf-8", errors="replace")
+        names = _re.findall(r"TLauncher-(\d+(?:\.\d+){1,3})", html)
+        if names:
+            v = max(names, key=_ver_tuple)
+            debug.dbg(f"_tlauncher_latest_version html -> {v}")
+            return v
+    except Exception as e:
+        debug.dbg(f"_tlauncher_latest_version html: {e}", level="WARN")
+    return None
+
+
 def _download_tlauncher_jar(dest):
     """Скачивает bootstrap .jar TLauncher: curl.exe напрямую, затем download_file.
 
-    Одна цепочка зеркал (TLAUNCHER_API_URLS), один тип файла (.jar с
-    PK-сигнатурой). Сначала — быстрый прямой заход curl.exe (Schannel,
-    поведение браузера; помогает когда Python-TLS режут, а сайт открывается);
-    если не вышло — обычная очередь download_file по тем же URL.
-    Возвращает путь к файлу либо None.
+    Одна цепочка зеркал, один тип файла (.jar с PK-сигнатурой). Сначала
+    определяется актуальная версия (update-check API / главная страница),
+    и canonical bootstrap URL строится под неё; если версия неизвестна —
+    берутся статические URL из TLAUNCHER_API_URLS. Затем — быстрый прямой
+    заход curl.exe (Schannel, поведение браузера; помогает когда
+    Python-TLS режут, а сайт открывается); если не вышло — обычная очередь
+    download_file по тем же URL. Возвращает путь к файлу либо None.
     """
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
 
-    first_url = TLAUNCHER_API_URLS[0][1]
+    # Очередь URL: живые источники первыми (canonical bootstrap под
+    # актуальную версию через api.tlauncher.org), статические зеркала —
+    # запасными. Web Archive сюда НЕ кладём: archived jar устаревает и
+    # bootstrap всё равно докачивает ядро с живых доменов.
+    queue = []
+    ver = _tlauncher_latest_version()
+    tmpl = next((u for _, u in TLAUNCHER_API_URLS
+                 if "{VERSION}" in u), None)
+    wildcard = next((u for n, u in TLAUNCHER_API_URLS
+                     if "*" in u.split("/")[-1]), None)
+    if ver and tmpl:
+        info(f"TLauncher: актуальная версия bootstrap — {ver}")
+        queue.append(("api.tlauncher.org (живой)", tmpl.replace("{VERSION}", ver)))
+    # Маска '*' — реальный рабочий endpoint отдачи последнего стабильного
+    # jar (api.tlauncher.org/update/down/TLauncher-*.jar). Если версия по
+    # API неизвестна — идём прямо на него; если известна — добавим вторым
+    # запасным зеркалом (на случай 404 версионированного URL).
+    if wildcard:
+        if not queue:
+            queue.append(("api.tlauncher.org (bootstrap .jar)", wildcard))
+        elif wildcard not in (u for _n, u in queue):
+            queue.append(("api.tlauncher.org (последний стабильный)", wildcard))
+    if not queue:
+        err("Не удалось определить актуальную версию TLauncher.")
+        hint("Повтори команду (API tlauncher иногда недоступен кратко) или")
+        hint(f"скачай portable .jar вручную: {TLAUNCHER_FALLBACK_PAGE}")
+        return None
+
+    first_url = queue[0][1]
     try:
         from modules.download import download_with_curl
         if download_with_curl(first_url, dest, timeout=90) \
@@ -1357,7 +1461,22 @@ def _download_tlauncher_jar(dest):
     except Exception as e:
         debug.dbg(f"_download_tlauncher_jar direct curl: {e}", level="WARN")
 
-    if download_file(list(TLAUNCHER_API_URLS), dest, "TLauncher Portable",
+    # Прямая закачка canonical URL не прошла — пробуем и остальные
+    # зеркала прямым curl (часто режется только Python-TLS, а curl.exe
+    # проходит), затем обычная очередь download_file по всей очереди.
+    for _name, url in queue[1:]:
+        try:
+            from modules.download import download_with_curl as _dwc
+            if _dwc(url, dest, timeout=90) \
+                    and _looks_like_jar(dest) \
+                    and dest.stat().st_size >= TLAUNCHER_MIN_SIZE:
+                ok(f"TLauncher (.jar) скачан напрямую: {url}")
+                return dest
+        except Exception as e:
+            debug.dbg(f"_download_tlauncher_jar direct curl[{url}]: {e}",
+                      level="WARN")
+
+    if download_file(queue, dest, "TLauncher Portable",
                      min_size_mb=1, silent=False) \
             and _looks_like_jar(dest) \
             and dest.stat().st_size >= TLAUNCHER_MIN_SIZE:
@@ -1627,10 +1746,14 @@ def finish_version_install(game_dir, mc_version, version_id):
         manifest = _http_get_json(MOJANG_VERSION_MANIFEST)
         entry = next(v for v in manifest["versions"] if v["id"] == mc_version)
         vm = _http_get_json(entry["url"], timeout=60)
+    except StopIteration:
+        err(f"Версия {mc_version} не найдена в манифесте Mojang")
+        return False
     except Exception as e:
         debug.dbg_exc(e, "finish_version/mojang")
         warn(f"Mojang meta недоступна: {e}")
         hint("Версия уже лежит в versions/ — лаунчер может докачать сам при запуске.")
+        hint("Диагноз сети: команда netcheck; если launchermeta перехвачен DNS — netfix.")
         return True
 
     try:
@@ -1669,7 +1792,9 @@ def finish_version_install(game_dir, mc_version, version_id):
             ok("client.jar уже на месте")
         else:
             info(f"Скачиваю Minecraft {mc_version} client.jar (~40 МБ)...")
-            if download_file([("Mojang", url)], jar_path, "Minecraft client", min_size_mb=5):
+            # Очередь с зеркалом piston-meta: launcher.mojang.com /
+            # launchermeta-ссылки в РФ часто блокируются, piston-meta жив.
+            if download_file(mojang_url(url), jar_path, "Minecraft client", min_size_mb=5):
                 if sha1 and _sha1(jar_path) != sha1:
                     warn("SHA-1 client.jar не совпал — удаляю битый файл")
                     try:
@@ -1688,7 +1813,7 @@ def finish_version_install(game_dir, mc_version, version_id):
         a_path.parent.mkdir(parents=True, exist_ok=True)
         if not a_path.exists():
             info("Скачиваю индекс ресурсов (assets)...")
-            if download_file([("Mojang", a_url)], a_path, "Assets index", min_size_mb=0):
+            if download_file(mojang_url(a_url), a_path, "Assets index", min_size_mb=0):
                 ok("Assets index скачан")
             else:
                 warn("Assets index не скачан — не критично")

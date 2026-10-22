@@ -482,14 +482,19 @@ TLAUNCHER_JAR_NAME = "TLauncher.jar"
 # отвечает 403 (антибот) — из песочницы это проверить нельзя, но с
 # домашних РФ-IP открывается. Поэтому в очереди есть Web Archive.
 TLAUNCHER_MANUAL_PAGE = "https://tlauncher.org/"
+# Update-check API: список стабильных пакетов (нужен, чтобы строить
+# canonical bootstrap URL с актуальной версией — TLauncher-2.xx.x.jar).
+TLAUNCHER_VERSIONS_API = "https://api.tlauncher.org/update/packages/stable"
 TLAUNCHER_API_URLS = [
     # Основной URL отдачи bootstrap .jar (200 + PK-сигнатура, ~5 МБ).
+    # '*' / '{VERSION}' — плейсхолдеры версии; при неизвестной версии
+    # api.tlauncher.org отдаёт последний стабильный jar по маске '*'.
     ("api.tlauncher.org (bootstrap .jar)",
      "https://api.tlauncher.org/update/down/TLauncher-*.jar"),
-    # Резерв для DPI/RST-сетей: архивная копия того же bootstrap .jar.
-    ("Web Archive (bootstrap .jar)",
-     "https://web.archive.org/web/2024id_/https://api.tlauncher.org/"
-     "update/down/TLauncher-*.jar"),
+    # Canonical шаблон с явной версией (подставляется из VERSIONS_API):
+    # https://api.tlauncher.org/update/down/TLauncher-2.98.3.jar
+    ("api.tlauncher.org (версионированный)",
+     "https://api.tlauncher.org/update/down/TLauncher-{VERSION}.jar"),
 ]
 # Страница ручного скачивания — НЕ зеркало (это HTML, PK-валидатор его
 # отвергает), а подсказка пользователю, если вся очередь не прошла.
@@ -819,8 +824,38 @@ MAVEN_CENTRAL = "https://repo1.maven.org/maven2/"
 
 # Mojang — списки версий и клиентские jar'ы (для доведения версии до конца,
 # чтобы лаунчер видел установленный модпак целиком).
-MOJANG_VERSION_MANIFEST = "https://launchermeta.mojang.com/mc/game/version_manifest.json"
+# ВАЖНО: launchermeta.mojang.com в РФ часто перехватывается системным DNS
+# (netcheck показывает 🚫), а prismlauncher.org не открывается вообще.
+# piston-meta.mojang.com — актуальное зеркало Mojang с идентичными путями;
+# оно первое в очереди, launchermeta остаётся запасным.
+MOJANG_VERSION_MANIFEST = "https://piston-meta.mojang.com/mc/game/version_manifest.json"
+MOJANG_VERSION_MANIFEST_MIRRORS = [
+    ("piston-meta (Mojang)",
+     "https://piston-meta.mojang.com/mc/game/version_manifest.json"),
+    ("launchermeta (Mojang)",
+     "https://launchermeta.mojang.com/mc/game/version_manifest.json"),
+]
 MOJANG_RESOURCES = "https://resources.download.minecraft.net/"
+
+
+def mojang_url(url):
+    """Заменяет домен meta-ссылок Mojang на живой зеркальный вариант.
+
+    Возвращает список [(имя, url)] для download_file: сначала зеркало
+    piston-meta (работает даже когда launchermeta перехвачен DNS), затем
+    оригинальный URL как есть. Не-mojang ссылки проходят без изменений.
+    """
+    if not url:
+        return []
+    u = url
+    for dom in ("launchermeta.mojang.com", "launcherpiston.mojang.com"):
+        if dom in u:
+            mirrored = u.replace(dom, "piston-meta.mojang.com")
+            out = [("piston-meta (Mojang)", mirrored)]
+            if mirrored != url:
+                out.append(("launchermeta (Mojang)", url))
+            return out
+    return [("Mojang", u)]
 
 
 def _gh_mirror_list(base_url, direct_name="GitHub (прямой)"):
