@@ -27,7 +27,10 @@ from modules.config import (
     SODIUM_VERSIONS_API, SODIUM_PINNED_VERSION, SODIUM_MC_VERSION,
     luxium_supports_fabric, luxium_fabric_dep,
 
-    LEGACY_MANUAL_PAGE, LEGACY_MANUAL_JAR_URL,)
+    LEGACY_MANUAL_PAGE, LEGACY_MANUAL_JAR_URL,
+    TLAUNCHER_DIR_NAME, TLAUNCHER_JAR_NAME, TLAUNCHER_MANUAL_PAGE,
+    TLAUNCHER_API_URLS, TLAUNCHER_MIN_SIZE,
+    TLAUNCHER_FALLBACK_PAGE,)
 from modules import net
 from modules.download import download_file, head_check
 from modules.hash_utils import verify_sha512, verify_sha1, copy_to_clipboard
@@ -1268,6 +1271,187 @@ def setup_legacy():
         hint("повтори `legacy`: скрипт найдёт файл сам и запустит через Java.")
         hint("Если Java не установлена — команда install-java.")
     return good
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  TLAUNCHER (portable bootstrap .jar)
+# ═══════════════════════════════════════════════════════════════════
+
+def _tlauncher_dir():
+    """Папка TLauncher внутри portable-дерева (~/mc-portable/tlauncher)."""
+    return WINE_DIR / TLAUNCHER_DIR_NAME
+
+
+def _find_local_tlauncher_jar():
+    """Ищет уже скачанный TLauncher bootstrap .jar.
+
+    Места: наша папка tlauncher/, «Загрузки» (браузер часто сохраняет как
+    TLauncher-2.xx.x.jar или вообще без расширения), стандартные папки
+    самого TLauncher (%APPDATA%\\.tlauncher, ~/.tlauncher). Принимается
+    только настоящий PK-.jar достаточного размера — HTML-заглушки
+    фильтров и огрызки отвергаются (тот же строгий подход, что у legacy).
+    """
+    candidates = [
+        _tlauncher_dir() / TLAUNCHER_JAR_NAME,
+    ]
+    for pattern in ("TLauncher*", "tlauncher*"):
+        try:
+            candidates += sorted(Path.home().glob(f"Downloads/{pattern}"),
+                                 key=lambda p: p.stat().st_size, reverse=True)
+        except Exception as e:
+            debug.dbg(f"_find_local_tlauncher_jar glob {pattern}: {e}",
+                      level="WARN")
+    seen = set()
+    from modules.platform_utils import IS_WINDOWS as _IS_WIN
+    bases = [Path.home() / ".tlauncher"]
+    if _IS_WIN:
+        appdata = os.environ.get("APPDATA", "")
+        if appdata:
+            bases.append(Path(appdata) / ".tlauncher")
+    for base in bases:
+        try:
+            if not base.is_dir():
+                continue
+            for cand in sorted(base.rglob("*.jar"),
+                               key=lambda p: p.stat().st_size,
+                               reverse=True)[:10]:
+                if str(cand) not in seen:
+                    seen.add(str(cand))
+                    candidates.append(cand)
+        except Exception as e:
+            debug.dbg(f"_find_local_tlauncher_jar scan {base}: {e}",
+                      level="WARN")
+    for p in candidates:
+        try:
+            if not (p.exists() and p.is_file()):
+                continue
+            if p.suffix.lower() == ".exe":
+                continue          # установщик не нужен — только .jar
+            if p.stat().st_size >= TLAUNCHER_MIN_SIZE and _looks_like_jar(p):
+                return p
+        except OSError:
+            continue
+    return None
+
+
+def _download_tlauncher_jar(dest):
+    """Скачивает bootstrap .jar TLauncher: curl.exe напрямую, затем download_file.
+
+    Одна цепочка зеркал (TLAUNCHER_API_URLS), один тип файла (.jar с
+    PK-сигнатурой). Сначала — быстрый прямой заход curl.exe (Schannel,
+    поведение браузера; помогает когда Python-TLS режут, а сайт открывается);
+    если не вышло — обычная очередь download_file по тем же URL.
+    Возвращает путь к файлу либо None.
+    """
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    first_url = TLAUNCHER_API_URLS[0][1]
+    try:
+        from modules.download import download_with_curl
+        if download_with_curl(first_url, dest, timeout=90) \
+                and _looks_like_jar(dest) \
+                and dest.stat().st_size >= TLAUNCHER_MIN_SIZE:
+            ok(f"TLauncher (.jar) скачан напрямую: {first_url}")
+            return dest
+    except Exception as e:
+        debug.dbg(f"_download_tlauncher_jar direct curl: {e}", level="WARN")
+
+    if download_file(list(TLAUNCHER_API_URLS), dest, "TLauncher Portable",
+                     min_size_mb=1, silent=False) \
+            and _looks_like_jar(dest) \
+            and dest.stat().st_size >= TLAUNCHER_MIN_SIZE:
+        return dest
+
+    # Битый огрызок (HTML/MZ/обрезок) на диске мешает повторной закачке
+    # и сбивает поиск кэша — чистим (тот же принцип, что в legacy).
+    try:
+        if dest.exists() and not _looks_like_jar(dest):
+            dest.unlink()
+    except OSError as e:
+        debug.dbg(f"_download_tlauncher_jar unlink-bad: {e}", level="WARN")
+    return None
+
+
+def setup_tlauncher():
+    """TLauncher — portable bootstrap .jar, одна цепочка зеркал, один тип файла.
+
+    Тот же проверенный шаблон, что и у Legacy Launcher после чистки:
+      1) проверить Java (bootstrap .jar без Java не запустится);
+      2) найти уже скачанный .jar (tlauncher/ / Downloads / ~/.tlauncher);
+      3) не найден — скачать bootstrap .jar (curl напрямую → зеркала);
+      4) запустить через штатную Java (-Dсвойства ДО -jar);
+      5) не вышло — понятный ручной путь (.jar с официального сайта).
+    Установщики .exe сознательно не поддерживаются: они и рождали
+    «смешение типов файлов» в истории проекта.
+    """
+    info(f"{BOLD}TLauncher{RESET}")
+
+    # 1. Окружение: TLauncher = чистая Java.
+    java_bin, java_home, java_status = find_java()
+    if not java_bin:
+        warn(f"Java: {java_status}. TLauncher работает на Java.")
+        try:
+            answer = input(f"{MAGENTA}Скачать портативную JDK 17 сейчас? "
+                           f"[Y/n]: {RESET}").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return False
+        if answer in ("", "y", "yes", "д", "да"):
+            if not install_portable_java():
+                err("JDK установить не удалось — TLauncher без Java не запустить.")
+                hint("Попробуй позже: install-java, затем снова tlauncher")
+                return False
+            java_bin, java_home, java_status = find_java()
+        else:
+            hint("Отменено. Установи Java командой install-java, "
+                 "затем повтори tlauncher")
+            return False
+
+    jar_dir = _tlauncher_dir()
+    jar_path = jar_dir / TLAUNCHER_JAR_NAME
+
+    # 2. Уже скачан? (наш кэш / Downloads / ~/.tlauncher)
+    existing = _find_local_tlauncher_jar()
+    if existing:
+        jar_path = existing
+        ok(f"TLauncher .jar уже есть: {jar_path}")
+    else:
+        # 3. Скачиваем bootstrap .jar.
+        info("Скачиваю TLauncher (portable bootstrap .jar)...")
+        got = _download_tlauncher_jar(jar_path)
+        if got:
+            jar_path = got
+            ok(f"Скачано: {jar_path}")
+        else:
+            # 5. Фоллбэк — ручное скачивание из браузера.
+            err("Не удалось скачать TLauncher автоматически.")
+            hint(f"Правильная страница для ручного скачивания: "
+                 f"{TLAUNCHER_FALLBACK_PAGE} («Скачать TLauncher», portable .jar)")
+            hint("Сохрани файл в:")
+            hint(f"  {jar_path}")
+            try:
+                if copy_to_clipboard(str(jar_path)):
+                    ok("Путь для сохранения скопирован в буфер обмена")
+            except Exception as e:
+                debug.dbg(f"clipboard: {e}", level="WARN")
+            import webbrowser
+            try:
+                webbrowser.open(TLAUNCHER_MANUAL_PAGE)
+            except Exception as e:
+                debug.dbg(f"webbrowser tlauncher: {e}", level="WARN")
+            found = _find_local_tlauncher_jar()
+            if found:
+                ok(f"Нашёл скачанный лаунчер: {found}")
+                jar_path = found
+            else:
+                return False
+
+    # 4. Запуск через Java (_run_legacy_jar универсален для bootstrap .jar:
+    # корректный порядок -D... перед -jar, javaw detached на Windows,
+    # hosts-обход DNS-перехвата).
+    print()
+    return _run_legacy_jar(jar_path)
 
 
 # ═══════════════════════════════════════════════════════════════════

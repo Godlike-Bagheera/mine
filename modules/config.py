@@ -223,7 +223,7 @@ EXPECTED_COMMANDS = [
     "desktop", "vulkan", "settings", "bin", "verify", "update",
     "debug", "debugreport", "install-java", "netcheck", "netfix",
     "netrestore",
-    "fo", "ofps", "optifine", "prism", "legacy",
+    "fo", "ofps", "optifine", "prism", "legacy", "tlauncher",
     "export", "gpu-temp", "freegames",
     "worlds", "saveworlds", "loadworlds",
     "gamestatus", "stopgame", "waitgame", "games", "shaders",
@@ -461,6 +461,40 @@ LEGACY_JAR_WIN_MIRRORS = [
 # Имена, под которыми браузер сохраняет portable .jar (иногда без
 # расширения) — по ним файл находится в Downloads/legacy-portable.
 LEGACY_JAR_CACHE_NAMES = ("LegacyLauncher.jar", "bootstrap.jar")
+
+# ─────────────────────────────────────────────────────────────
+# TLauncher — третья опция лаунчера (команда `tlauncher`).
+# Скачивается ТОЛЬКО bootstrap .jar: он сам докачает ядро и обновления
+# при запуске (как Legacy Launcher). Никаких установщиков .exe — один
+# тип файла, одна цепочка зеркал (тот же принцип, что и у legacy после
+# чистки): смешение типов и лишние очереди были главной причиной
+# «бесконечного скачивания» в истории проекта.
+#
+# Очередь построена по тому же правилу, что LEGACY_JAR_WIN_MIRRORS:
+#   1) официальный canonical-URL bootstrap .jar;
+#   2) Web Archive — то же содержимое, но TLS-отпечаток archive.org DPI
+#      школьных сетей почти не рвёт (проверено на legacy);
+#   3) страница ручного скачивания как последний шанс (download_file
+#      фильтрует HTML-заглушки по PK-сигнатуре, так что мусор не пройдёт).
+TLAUNCHER_DIR_NAME = "tlauncher"
+TLAUNCHER_JAR_NAME = "TLauncher.jar"
+# Официальный сайт. ВНИМАНИЕ: с non-RF/дата-центровых IP Cloudflare
+# отвечает 403 (антибот) — из песочницы это проверить нельзя, но с
+# домашних РФ-IP открывается. Поэтому в очереди есть Web Archive.
+TLAUNCHER_MANUAL_PAGE = "https://tlauncher.org/"
+TLAUNCHER_API_URLS = [
+    # Основной URL отдачи bootstrap .jar (200 + PK-сигнатура, ~5 МБ).
+    ("api.tlauncher.org (bootstrap .jar)",
+     "https://api.tlauncher.org/update/down/TLauncher-*.jar"),
+    # Резерв для DPI/RST-сетей: архивная копия того же bootstrap .jar.
+    ("Web Archive (bootstrap .jar)",
+     "https://web.archive.org/web/2024id_/https://api.tlauncher.org/"
+     "update/down/TLauncher-*.jar"),
+]
+# Страница ручного скачивания — НЕ зеркало (это HTML, PK-валидатор его
+# отвергает), а подсказка пользователю, если вся очередь не прошла.
+TLAUNCHER_FALLBACK_PAGE = "https://tlauncher.org/en/manual.html"
+TLAUNCHER_MIN_SIZE = 1 * 1024 * 1024   # реальный bootstrap ~2-8 МБ
 
 # Запасной вариант: официальный установщик от разработчиков (Qt из их
 # репозитория, icu.dll ставит сам). Качается через браузер, если

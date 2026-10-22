@@ -23,7 +23,7 @@ from modules.launcher import (
 from modules.java import find_java, cmd_install_java
 from modules.minecraft import (
     cmd_minecraft, setup_fabulously_optimized, setup_optifine,
-    setup_prism, setup_legacy, cmd_fo_autofix, setup_optimized_fps,
+    setup_prism, setup_legacy, setup_tlauncher, cmd_fo_autofix, setup_optimized_fps,
 )
 from modules.commands import (
     cmd_debug, cmd_debugreport, cmd_reset, cmd_vulkan, cmd_verify,
@@ -109,6 +109,7 @@ def print_help():
     print(f"  {CYAN}optifine{RESET}             — OptiFine")
     print(f"  {CYAN}prism{RESET}                — Prism Launcher")
     print(f"  {CYAN}legacy{RESET}               — Legacy Launcher")
+    print(f"  {CYAN}tlauncher{RESET}            — TLauncher (portable .jar)")
     print(f"  {CYAN}shaders{RESET}              — установить шейдер-пак (shaderpacks)")
     print(f"  {CYAN}shaders <URL>{RESET}       — пак по прямой ссылке (.zip)")
     print(f"  {CYAN}install-java{RESET}         — портативная JDK 17")
@@ -220,6 +221,9 @@ COMMAND_REGISTRY = {
     "minecraft prism": lambda a="": setup_prism(),
     "legacy": lambda a="": setup_legacy(), "майнкрафт legacy": lambda a="": setup_legacy(),
     "minecraft legacy": lambda a="": setup_legacy(),
+    "tlauncher": lambda a="": setup_tlauncher(), "тилоч": lambda a="": setup_tlauncher(),
+    "тлаунчер": lambda a="": setup_tlauncher(), "майнкрафт tlauncher": lambda a="": setup_tlauncher(),
+    "minecraft tlauncher": lambda a="": setup_tlauncher(),
     "saveworlds": lambda a="": cmd_save_worlds(), "сохранитьмиры": lambda a="": cmd_save_worlds(),
     "миры на диск": lambda a="": cmd_save_worlds(), "worlds-save": lambda a="": cmd_save_worlds(),
     "loadworlds": lambda a="": cmd_load_worlds(), "загрузитьмиры": lambda a="": cmd_load_worlds(),

@@ -590,6 +590,119 @@ check("setup_legacy: .exe-загрузка выметена из Windows-вет�
 check("_legacy_curl_once прогоняет ЕДИНУЮ jar-очередь через run_curl_queues",
       "run_curl_queues([legacy_jar_mirrors(True)]," in seg_src)
 
+# ═══ 12. TLauncher: portable bootstrap .jar, одна цепочка зеркал ═══
+import modules.minecraft as mc_mod
+
+# 12.1 Константы конфигурации
+check("конфиг: TLAUNCHER_* заданы",
+      cfg.TLAUNCHER_DIR_NAME == "tlauncher"
+      and cfg.TLAUNCHER_JAR_NAME.endswith(".jar")
+      and cfg.TLAUNCHER_MIN_SIZE >= 1024 * 1024
+      and len(cfg.TLAUNCHER_API_URLS) >= 1)
+check("конфиг: зеркала TLauncher — только https .jar (без .exe)",
+      all(u.startswith("https://") and u.endswith(".jar")
+          for _n, u in cfg.TLAUNCHER_API_URLS))
+check("команда tlauncher в EXPECTED_COMMANDS", "tlauncher" in cfg.EXPECTED_COMMANDS)
+
+# 12.2 Валидатор кэша: принимается только PK-.jar достаточного размера;
+# HTML-заглушка и .exe-огрызок отвергаются (тот же строгий подход, что legacy).
+tl_dir = tmp / "tlauncher"
+tl_dir.mkdir(parents=True, exist_ok=True)
+good_tl = tl_dir / cfg.TLAUNCHER_JAR_NAME
+good_tl.write_bytes(b"PK\x03\x04" + b"\x00" * cfg.TLAUNCHER_MIN_SIZE)
+bad_tl = tl_dir / "TLauncher-html.jar"
+bad_tl.write_text("<html>blocked</html>", encoding="utf-8")
+exe_tl = tl_dir / "TLauncher-installer.exe"
+exe_tl.write_bytes(b"MZ\x90\x00" + b"\x00" * cfg.TLAUNCHER_MIN_SIZE)
+_orig_wd = mc_mod.WINE_DIR
+mc_mod.WINE_DIR = tmp                     # _tlauncher_dir -> tmp/tlauncher
+try:
+    found = mc_mod._find_local_tlauncher_jar()
+    check("_find_local_tlauncher_jar находит живой PK-.jar из папки tlauncher/",
+          found is not None and found.name == cfg.TLAUNCHER_JAR_NAME)
+    good_tl.unlink()                        # остаётся только мусор
+    import shutil as _sh
+    _sh.copy(str(bad_tl), str(tl_dir / cfg.TLAUNCHER_JAR_NAME))
+    found2 = mc_mod._find_local_tlauncher_jar()
+    check("_find_local_tlauncher_jar ОТВЕРГАЕТ HTML-заглушку под именем кэша",
+          found2 is None)
+    (tl_dir / cfg.TLAUNCHER_JAR_NAME).unlink()
+    # .exe даже гигантский не принимается (установщики не поддерживаем)
+    big_exe = tl_dir / cfg.TLAUNCHER_JAR_NAME
+    big_exe.write_bytes(b"MZ\x90\x00" + b"\x00" * cfg.TLAUNCHER_MIN_SIZE)
+    found3 = mc_mod._find_local_tlauncher_jar()
+    check("_find_local_tlauncher_jar ОТВЕРГАЕТ MZ-огрызок/установщик",
+          found3 is None)
+finally:
+    mc_mod.WINE_DIR = _orig_wd
+
+# 12.3 _download_tlauncher_jar: сначала прямой curl (как браузер), затем
+# очередь download_file; HTML-огрызок после неудачи удаляется с диска.
+seen_tl = {"curl": [], "df": []}
+
+
+def _tl_curl_fail(url, dest, timeout=60):
+    seen_tl["curl"].append(url)
+    return False
+
+
+def _tl_df_ok(mirrors, dest, label, **kw):
+    seen_tl["df"].append([m[1] for m in mirrors])
+    Path(dest).write_bytes(b"PK\x03\x04" + b"\x00" * cfg.TLAUNCHER_MIN_SIZE)
+    return True
+
+
+dest_tl = tmp / "tl-dl" / cfg.TLAUNCHER_JAR_NAME
+_orig_dwc = dl_mod.download_with_curl
+_orig_df_tl = mc_mod.download_file
+dl_mod.download_with_curl = _tl_curl_fail
+mc_mod.download_file = _tl_df_ok
+try:
+    got = mc_mod._download_tlauncher_jar(dest_tl)
+    check("_download_tlauncher_jar: при отказе прямого curl качает "
+          "по ЕДИНОЙ очереди зеркал TLAUNCHER_API_URLS",
+          got is not None and seen_tl["curl"] == [cfg.TLAUNCHER_API_URLS[0][1]]
+          and seen_tl["df"][0] == [u for _n, u in cfg.TLAUNCHER_API_URLS])
+    dest_tl.unlink()
+
+    # Прямой curl успешен → зеркала вообще не трогаются
+    def _tl_curl_ok(url, dest, timeout=60):
+        seen_tl["curl"].append(url)
+        Path(dest).write_bytes(b"PK\x03\x04" + b"\x00" * cfg.TLAUNCHER_MIN_SIZE)
+        return True
+    dl_mod.download_with_curl = _tl_curl_ok
+    seen_tl["curl"], seen_tl["df"] = [], []
+    got2 = mc_mod._download_tlauncher_jar(dest_tl)
+    check("_download_tlauncher_jar: прямая закачка curl = успех без очереди",
+          got2 is not None and seen_tl["df"] == [])
+    dest_tl.unlink()
+
+    # Полный провал: HTML-огрызок не оставляем на диске
+    def _tl_df_html(mirrors, dest, label, **kw):
+        Path(dest).write_text("<html>403</html>", encoding="utf-8")
+        return True     # download_file «думает», что скачал — решает валидатор
+    dl_mod.download_with_curl = _tl_curl_fail
+    mc_mod.download_file = _tl_df_html
+    got3 = mc_mod._download_tlauncher_jar(dest_tl)
+    check("_download_tlauncher_jar: HTML-огрызок отвергнут и удалён",
+          got3 is None and not dest_tl.exists())
+finally:
+    dl_mod.download_with_curl = _orig_dwc
+    mc_mod.download_file = _orig_df_tl
+
+# 12.4 Интеграция в UI: команда ведёт в setup_tlauncher, запуск переиспользует
+# исправленный _run_legacy_jar (-D свойства ДО -jar).
+src_ui = open(ROOT / "modules" / "ui.py", encoding="utf-8").read()
+check("ui: команда tlauncher привязана к setup_tlauncher",
+      '"tlauncher": lambda a="": setup_tlauncher()' in src_ui
+      and "setup_tlauncher," in src_ui)
+seg_tl_src = seg_src[seg_src.index("def setup_tlauncher():"):]
+seg_tl_src = seg_tl_src[:seg_tl_src.index("\n\n\n")]
+check("setup_tlauncher: запуск через _run_legacy_jar (правильный порядок java-аргументов)",
+      "_run_legacy_jar(jar_path)" in seg_tl_src)
+check("setup_tlauncher: Java проверяется до сетевых операций",
+      seg_tl_src.index("find_java()") < seg_tl_src.index("_download_tlauncher_jar"))
+
 print()
 if fails:
     print(f"ПРОВАЛОВ: {len(fails)} -> {fails}")
