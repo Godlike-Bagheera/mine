@@ -180,7 +180,11 @@ class ScriptFailed(Exception):
         return self.__repr__() + "\n--- вывод скрипта ---\n" + self.output
 
 
-@pytest.mark.parametrize("script_path", _discover_scripts())
+@pytest.fixture(params=_discover_scripts(), ids=lambda p: Path(p).name)
+def script_path(request):
+    return request.param
+
+
 def test_standalone_scripts(script_path):
     """Каждый tests/test_*.py выполняется как отдельный скрипт.
 
