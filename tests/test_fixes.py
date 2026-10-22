@@ -363,6 +363,7 @@ check("_curl_attempt_budget на короткой очереди = len(mirrors)"
 
 # 11.2 run_curl_queues: budget/truncated + разделение между очередями
 _orig_dqwc = dl_mod2.download_queue_with_curl
+_orig_rcq = dl_mod2.run_curl_queues
 _orig_which = dl_mod2.shutil_which_curl
 _seen_submits = []
 try:
@@ -410,7 +411,10 @@ finally:
 
 # 11.3 download_queue_with_curl с validator: .exe вместо .jar ОТВЕРГАЕТСЯ
 # (раньше файл по размеру считался успехом, следующий этап его ломал —
-# и весь круг загрузки повторялся заново: простыня «curl не смог»)
+# и весь круг загрузки повторялся заново: простыня «curl не смог»).
+# Упрощение (проблема №2): теперь один тип файла — portable .jar;
+# строгий валидатор PK-.jar, никаких «всеядных» PK|MZ-валидаторов и
+# .exe-запасных очередей.
 exe_jar = tmp / "FakeLauncher.jar"
 exe_jar.write_bytes(b"MZ\x90\x00" + b"\x00" * (2 * 1024 * 1024))
 _orig_dlvcurl = dl_mod2.download_via_curl
@@ -439,18 +443,28 @@ try:
           got is None)
     check("отвергнутый мусор удалён с диска", not exe_jar.exists())
 
-    # Тот же файл, но валидатор ждёт MZ (мы просили установщик) — успех.
-    # ВАЖНО: dest переименован в .exe — _downloaded_file_plausible по
-    # расширению .jar требовал бы PK-сигнатуру и честно отверг бы PE-файл.
-    exe_true = tmp / "RealLauncher.exe"
-    exe_true.write_bytes(b"MZ\x90\x00" + b"\x00" * (2 * 1024 * 1024))
+    # Настоящий PK-.jar той же очередью принимается (строгий валидатор
+    # не «перегибает»: валидный артефакт — успех с первого зеркала).
+    def _fake_dlvcurl_jar(url, dest, timeout=60, extra=None,
+                          return_error=False):
+        p = Path(str(dest) + ".part") if str(dest).endswith(".part") \
+            else None
+        tgt = p if (p and p.exists()) else Path(dest)
+        try:
+            tgt.write_bytes(b"PK\x03\x04" + b"\x00" * (2 * 1024 * 1024))
+            return "" if return_error else True
+        except OSError:
+            return "disk error" if return_error else False
+
+    dl_mod2.download_via_curl = _fake_dlvcurl_jar
+    good_dest = tmp / "GoodLauncher.jar"
     got2 = dl_mod2.download_queue_with_curl(
-        [("mirrorX", "http://mx")], exe_true, min_bytes=1024, silent=True,
-        validator=mc._is_exe_installer)
-    check("validator: MZ-.exe принимается там, где нужен установщик",
+        [("mirrorX", "http://mx")], good_dest, min_bytes=1024, silent=True,
+        validator=mc._looks_like_jar)
+    check("validator: настоящий PK-.jar принимается",
           got2 == "http://mx")
-    if exe_true.exists():
-        exe_true.unlink()
+    if good_dest.exists():
+        good_dest.unlink()
     # max_attempts=0 — очередь не гоняется вообще (бюджет исчерпан)
     got3 = dl_mod2.download_queue_with_curl(
         [("mirrorY", "http://my")], tmp / "never.bin", min_bytes=1024,
@@ -465,46 +479,61 @@ finally:
     except OSError:
         pass
 
-# 11.4 Хелперы setup_legacy(): кэш .exe по всем браузерным именам
+# 11.4 Кэш portable .jar: _cached_jar_ok принимает только живой PK-.jar
+# достаточного размера; HTML-заглушка фильтра и огрызок докачки — нет.
 ledir = tmp / "legacy-portable"
 ledir.mkdir(exist_ok=True)
-big_exe = ledir / "Legacy Launcher Setup.exe"   # имя из браузера
-big_exe.write_bytes(b"MZ" + b"\x00" * (3 * 1024 * 1024))
-check("_exe_cached_ok видит установщик, сохранённый браузером",
-      mc._exe_cached_ok(ledir))
-check("_exe_cached_path возвращает реальное имя файла",
-      mc._exe_cached_path(ledir) == big_exe)
-small = ledir / "LegacyLauncher-setup.exe"
-small.write_bytes(b"MZ\x00\x00tiny")
-check("_exe_size_ok отвергает огрызок (<2 МБ)", not mc._exe_size_ok(small))
-big_exe.unlink()
 good_jar = ledir / "LegacyLauncher.jar"
 good_jar.write_bytes(b"PK\x03\x04" + b"\x00" * (2 * 1024 * 1024))
 check("_cached_jar_ok принимает настоящий PK-.jar", mc._cached_jar_ok(good_jar))
 good_jar.write_bytes(b"<html>blocked</html>" * 100000)
 check("_cached_jar_ok отвергает HTML-заглушку фильтра",
       not mc._cached_jar_ok(good_jar))
+good_jar.write_bytes(b"PK\x03\x04" + b"\x00" * 1024)
+check("_cached_jar_ok отвергает огрызок (< LEGACY_JAR_MIN_SIZE)",
+      not mc._cached_jar_ok(good_jar))
+# .exe-установщик больше нигде не считается валидным артефактом Legacy
+check("всеядный PK|MZ-валидатор (.exe как успех) удалён",
+      not hasattr(mc, "_is_exe_installer"))
+check(".exe-запасные очереди/хелперы (.exe cached/fallback) удалены",
+      not hasattr(mc, "_exe_cached_ok")
+      and not hasattr(mc, "_exe_cached_path")
+      and not hasattr(mc, "_exe_size_ok")
+      and not hasattr(mc, "_legacy_exe_fallback"))
 
-# 11.5 _legacy_exe_fallback: уже скачанный установщик НЕ перекачивается
+# 11.5 _legacy_curl_once: ОДИН прогон единой jar-очереди со строгим
+# валидатором; битый огрызок на диске удаляется (не имитирует успех).
 ledir2 = tmp / "lp2"
 ledir2.mkdir(exist_ok=True)
-exe_p = ledir2 / "LegacyLauncher-setup.exe"
-exe_p.write_bytes(b"MZ" + b"\x00" * (3 * 1024 * 1024))
-_called = {"n": 0}
-try:
-    dl_mod2.download_queue_with_curl = \
-        lambda *a, **k: _called.__setitem__("n", _called["n"] + 1) or None
-    check("fallback: кэш .exe найден — сеть не трогается",
-          mc._legacy_exe_fallback(exe_p, [("cdn", "http://cdn")]) is True
-          and _called["n"] == 0)
-    exe_p.unlink()
-    check("fallback: без кэша делает ровно одну curl-очередь",
-          mc._legacy_exe_fallback(exe_p, [("cdn", "http://cdn")]) is False
-          and _called["n"] == 1)
-finally:
-    dl_mod2.download_queue_with_curl = _orig_dqwc
+cand2 = ledir2 / "LegacyLauncher.jar"
+_seen_rq = []
 
-# 11.6 setup_legacy(): Windows-ветка делает ОДИН curl-прогон (не три круга).
+
+def _fake_run_curl_queues_fail(queues, dest, **kw):
+    _seen_rq.append((queues, kw.get("validator")))
+    cand2.write_bytes(b"MZ" + b"\x00" * (3 * 1024 * 1024))  # CDN отдал .exe
+    return {"ok": False, "url": None, "attempts": 3, "budget": 3,
+            "truncated": False, "mirrors_total": 3}
+
+
+dl_mod2.run_curl_queues = _fake_run_curl_queues_fail
+try:
+    resume = mc._legacy_curl_once(cand2)
+    q, val = _seen_rq[0]
+    check("_legacy_curl_once: одна очередь (не jar+exe)", len(q) == 1)
+    check("_legacy_curl_once: очередь = legacy_jar_mirrors(True)",
+          q[0] == cfg.legacy_jar_mirrors(True))
+    check("_legacy_curl_once: строгий PK-.jar валидатор",
+          val is mc._looks_like_jar)
+    check("_legacy_curl_once: .exe-огрызок удалён с диска",
+          not cand2.exists())
+    check("_legacy_curl_once возвращает резюме прогона",
+          resume["ok"] is False and resume["attempts"] == 3)
+finally:
+    dl_mod2.run_curl_queues = _orig_rcq
+
+# 11.6 setup_legacy(): Windows-ветка делает ОДИН curl-прогон (не три круга),
+# только portable .jar, без смешения типов файлов.
 # Проверяем исходник функции статически: форсировать IS_WINDOWS нельзя —
 # `from ... import IS_WINDOWS` связан при импорте модуля.
 seg_src = open(ROOT / "modules" / "minecraft.py", encoding="utf-8").read()
@@ -512,17 +541,24 @@ i0 = seg_src.index("def setup_legacy():")
 i1 = seg_src.index("# ═", i0 + 10)
 seg = seg_src[i0:i1]
 check("setup_legacy: единая точка curl-загрузки (_legacy_curl_once)",
-      "_legacy_curl_once(cand, exe_cand)" in seg
+      "_legacy_curl_once(cand)" in seg
       and "download_queue_with_curl(" not in seg)
 check("setup_legacy: второй полный круг jar-зеркал убран "
       "(нет повторного legacy_jar_mirrors внутри)",
       seg.count("legacy_jar_mirrors") == 0)
-check("setup_legacy: .exe-запасной путь идёт через _legacy_exe_fallback "
-      "(кэш не перекачивается)",
-      "_legacy_exe_fallback(exe_path, exe_queue)" in seg
-      and "download_via_curl" not in seg)
-check("_legacy_curl_once передаёт оба списка очередей в run_curl_queues",
-      "run_curl_queues([legacy_jar_mirrors(True)," in seg_src)
+# Срез «кода» функции: строки с # (комментарии) и docstring — в них
+# исторические упоминания .exe допустимы; проверяем именно исполняемый код.
+seg_code = "\n".join(ln for ln in seg.splitlines()
+                     if not ln.strip().startswith("#"))
+i_doc = seg_code.index('"""')
+i_doc2 = seg_code.index('"""', i_doc + 3)
+seg_code = seg_code[:i_doc] + seg_code[i_doc2 + 3:]
+check("setup_legacy: .exe-загрузка выметена из Windows-ветки "
+      "(один тип файла — portable .jar, без запасных exe-очередей)",
+      "_exe" not in seg_code and ".exe" not in seg_code
+      and "download_via_curl" not in seg_code)
+check("_legacy_curl_once прогоняет ЕДИНУЮ jar-очередь через run_curl_queues",
+      "run_curl_queues([legacy_jar_mirrors(True)]," in seg_src)
 
 print()
 if fails:

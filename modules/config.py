@@ -312,24 +312,13 @@ PRISM_URL = ("https://github.com/PrismLauncher/PrismLauncher/releases/"
              "download/11.1.1/PrismLauncher-Windows-MinGW-w64-Portable-11.1.1.zip")
 
 # ─────────────────────────────────────────────────────────────
-# Legacy Launcher — .exe-установщик.
-# Официальная ссылка есть, но .exe всё равно падает в Wine 11 (WOW64).
-# Реально используется Portable .jar.
+# Legacy Launcher — единый тип файла: portable .jar.
+# Раньше здесь жила отдельная очередь .exe-установщиков (LEGACY_MIRRORS),
+# которая и создавала путаницу «смешение типов»: download_file() сохраняла
+# установщик в файл с именем ...LegacyLauncher.jar, валидатор по размеру
+# его принимал, а запустить как jar было нельзя. Очередь удалена; единственный
+# источник лаунчера — LEGACY_JAR_WIN_MIRRORS / LEGACY_JAR_MIRRORS ниже.
 # ─────────────────────────────────────────────────────────────
-LEGACY_MIRRORS = [
-    ("legacylauncher.ru (официальный)",
-     "https://dl.legacylauncher.ru/legacy/installer"),
-    ("GitHub (gradenGnostic)",
-     "https://github.com/gradenGnostic/LegacyLauncher/releases/download/v3.5.0/LegacyLauncher.Setup.3.5.0.exe"),
-    ("ghfast.top",
-     "https://ghfast.top/https://github.com/gradenGnostic/LegacyLauncher/releases/download/v3.5.0/LegacyLauncher.Setup.3.5.0.exe"),
-    ("ghproxy.net",
-     "https://ghproxy.net/https://github.com/gradenGnostic/LegacyLauncher/releases/download/v3.5.0/LegacyLauncher.Setup.3.5.0.exe"),
-    ("gh-proxy.com",
-     "https://gh-proxy.com/https://github.com/gradenGnostic/LegacyLauncher/releases/download/v3.5.0/LegacyLauncher.Setup.3.5.0.exe"),
-    ("Archive.org",
-     "https://archive.org/download/legacy-launcher-for-minecraft/LegacyLauncher_Installer_legacy.exe"),
-]
 
 _PRISM_WIN_BASE = ("https://github.com/PrismLauncher/PrismLauncher/releases/"
                    "download/11.1.1")
@@ -420,106 +409,81 @@ def prism_win_urls():
             out.append(item)
     return out
 
-# Зеркала Legacy Launcher Portable (.jar) для Windows с учётом блокировок:
-# к официальным доменам школьные фильтры часто рвут TLS (WinError 10054).
-# Порядок важен для curl-очереди (download_file на Windows сначала гоняет
-# curl.exe по всей очереди): archive.org — обычный статичный HTTPS без
-# редиректов иTLS-фиngerprint-блокировок, поэтому первым; официальные
-# домены — следом.
-# Официальный Yandex-CDN Legacy Launcher: домен dl-cdn-yc.legacylauncher.ru
-# проходит там, где все llaun.ch / legacylauncher.ru домены рвутся DPI
-# (rc=35 / WinError 10054). На нём лежат ОБА артефакта:
-#   * /legacy/bootstrap/LegacyLauncher.jar — НАСТОЯЩИЙ portable .jar (PK-,
-#     ~11 МБ) — самый быстрый чистый путь на Windows;
-#   * /legacy/installer/LegacyLauncher.exe — установщик (.exe, MZ-).
-# Ссылки одноразово-подписные (?md5=&expires=): без подписи CDN отвечает
-# 403, просроченная подпись — 410. Подпись .exe из этой очереди уже
-# истекла (проверено HEAD'ом: 410 Gone) — если curl вернёт 403/410,
-# обнови URL со страницы https://llaun.ch/exe (или бери свежий .jar ниже).
+# ─────────────────────────────────────────────────────────────
+# Legacy Launcher Portable (.jar) — одна цепочка зеркал, один тип файла.
+# ─────────────────────────────────────────────────────────────
+# ПРАВИЛО: скрипт скачивает ТОЛЬКО portable .jar (PK-\x03\x04, ~11 МБ) и
+# запускает его через Java. .exe-установщики из очередей убраны полностью:
+# раньше смешение типов давало «скачали MZ-.exe в файл LegacyLauncher.jar,
+# приняли его по размеру, запустить как jar нельзя». Каждое зеркало ниже
+# проверено (2026-10-22): оно отдаёт именно .jar или корректный 4xx-ответ,
+# который curl/urllib честно считают неудачей и идут дальше по очереди.
+#
+# Живые зеркала portable .jar:
+#   * https://llaun.ch/jar        → 302 на dl.llaun.ch/legacy/bootstrap
+#     (Cloudflare-fronted, поддерживает Range/докачку);
+#   * https://dl.llaun.ch/legacy/bootstrap — прямой адрес того же артефакта;
+#   * web.archive.org — зеркало llaun.ch/jar с нейтральным TLS, проходит
+#     там, где российские домены рвутся DPI (rc=35 / WinError 10054).
+LEGACY_JAR_MIRRORS = [
+    ("llaun.ch (официальный)",           "https://llaun.ch/jar"),
+    ("dl.llaun.ch (прямой)",             "https://dl.llaun.ch/legacy/bootstrap"),
+]
+
+# Windows-очередь: те же живые .jar-зеркала + нейтральные резервы.
+# Про Yandex-CDN (dl-cdn-yc.legacylauncher.ru): ссылки там одноразово-
+# подписные (?md5=&expires=), захардкоженная подпись в репозитории протухла
+# (HEAD даёт 410 Gone) — зеркало оставлено последним резервом «на случай»,
+# но полагаться на него нельзя: при 403/410 очередь мгновенно идёт дальше
+# (см. signed_url_expired в download.py). Если CDN оживёт — обнови URL со
+# страницы https://llaun.ch/jar.
 LEGACY_YANDEX_CDN_JAR = (
     "https://dl-cdn-yc.legacylauncher.ru/legacy/bootstrap/"
     "LegacyLauncher.jar?md5=2GkVngrgPKDBjiKk9BP0kg&expires=1792494154")
 LEGACY_WIN_OFFICIAL_CDN = [
-    # Первым — portable .jar с того же CDN: он в 10 раз легче установщика
-    # и не требует ручных действий (установщик нужно ещё запустить).
     ("Yandex CDN (официальный .jar)", LEGACY_YANDEX_CDN_JAR),
-    ("Yandex CDN (официальный .exe)",
-     "https://dl-cdn-yc.legacylauncher.ru/legacy/installer/LegacyLauncher.exe"
-     "?md5=amzePVm455iPVFWWsKbn8A&expires=1792485882"),
 ]
-
-# Скачанный браузером установщик Legacy тоже принимаем: в Windows он
-# кладёт файл как «Legacy Launcher Setup.exe» (с пробелами) — раньше поиск
-# кэша знал только наше имя LegacyLauncher-setup.exe, и уже скачанный
-# установщик не находился, скрипт качал 117 МБ заново.
-LEGACY_EXE_CACHE_NAMES = ("LegacyLauncher-setup.exe",
-                          "Legacy Launcher Setup.exe",
-                          "LegacyLauncherSetup.exe")
 
 LEGACY_JAR_WIN_MIRRORS = [
-    # Сначала пробуем быстрые .jar зеркала — если сеть их не блокирует, это
-    # самый чистый путь (portable без установщика). Но они часто RST'ятся DPI.
     ("llaun.ch (официальный)", "https://llaun.ch/jar"),
     ("dl.llaun.ch (прямой)", "https://dl.llaun.ch/legacy/bootstrap"),
-    # Web Archive: зеркало llaun.ch/jar с обычным (не Cloudflare) TLS —
-    # проходит там, где прямые домены рвутся с rc=35. Отдаёт редиректы на
-    # сохранённый bootstrap.jar; скачивание с -L работает стабильно.
+    # Web Archive: то же содержимое, но TLS-отпечаток archive.org — DPI
+    # школьных сетей его почти не рвёт. Отдаёт сохранённый bootstrap.jar.
     ("Web Archive (llaun.ch/jar)",
      "https://web.archive.org/web/2024id_/https://llaun.ch/jar"),
-    # Если быстрые .jar недоступны — идём на официальный Yandex-CDN: там
-    # лежат и portable .jar (/legacy/bootstrap/LegacyLauncher.jar), и
-    # установщик .exe (/legacy/installer/...). Домен Яндекса школьные
-    # фильтры обычно не рвут, поэтому зеркало реально рабочее.
-    *LEGACY_WIN_OFFICIAL_CDN,
-    # ВНИМАНИЕ: старого item «legacy-launcher-bootstrap» на archive.org не
-    # существует (404 + curl rc=23) — убрано из очереди, чтобы не тратить
-    # таймауты на заведомо мёртвое зеркало.
+    # go.legacylauncher.ru живёт, но для не-браузерных UA отвечает 403 —
+    # дешёвая попытка перед ручным путём (curl со Schannel иногда проходит).
     ("go.legacylauncher.ru", "https://go.legacylauncher.ru/jar"),
+    # Последний резерв — протухший подписной CDN (см. выше).
+    *LEGACY_WIN_OFFICIAL_CDN,
 ]
+
+# Имена, под которыми браузер сохраняет portable .jar (иногда без
+# расширения) — по ним файл находится в Downloads/legacy-portable.
+LEGACY_JAR_CACHE_NAMES = ("LegacyLauncher.jar", "bootstrap.jar")
 
 # Запасной вариант: официальный установщик от разработчиков (Qt из их
 # репозитория, icu.dll ставит сам). Качается через браузер, если
 # автоматическая загрузка блокируется сетью.
 PRISM_WIN_OFFICIAL_PAGE = "https://prismlauncher.org/downloads/"
 
-LEGACY_URL = LEGACY_MIRRORS[0][1]
-
-# ─────────────────────────────────────────────────────────────
-# Legacy Launcher Portable (.jar) — автоскачивание.
-# ─────────────────────────────────────────────────────────────
-# llaun.ch / dl.llaun.ch отдают НАСТОЯЩИЙ portable bootstrap .jar и
-# поддерживают докачку (Range) — они в начале очереди.
-LEGACY_JAR_MIRRORS = [
-    ("llaun.ch (официальный)",           "https://llaun.ch/jar"),
-    ("dl.llaun.ch (прямой)",             "https://dl.llaun.ch/legacy/bootstrap"),
-]
-
-# Запасные зеркала: эти URL отдают НЕ portable .jar, а .exe-установщик
-# (в config LEGACY_JAR_EXTS). В Windows-ветке legacy мы их не трогаем —
-# .exe требует Wine и известен крашем на Wine 11 (WOW64).
-LEGACY_JAR_FALLBACK_EXE = [
-    ("go.legacylauncher.ru (официальный)", "https://go.legacylauncher.ru/jar"),
-    ("dl.legacylauncher.ru (installer)",
-     "https://dl.legacylauncher.ru/legacy/installer"),
-    ("lln4.cc",                          "https://lln4.cc/jar"),
-]
-LEGACY_JAR_MIN_SIZE = 1 * 1024 * 1024   # реальный .jar ~ 2-5 МБ
-
 
 def legacy_jar_mirrors(is_windows):
-    """Очередь зеркал portable-лаунчера для download_file.
+    """Единая цепочка зеркал portable .jar для download_file/run_curl_queues.
 
-    На Windows — jar-зеркала с учётом сетевых блокировок (archive.org и
-    официальные домены; мёртвый api.legacylauncher.net в конце). Раньше
-    очередь начиналась с мёртвых/блокируемых зеркал и до живых llaun.ch
-    дело не доходило.
+    Один тип файла (jar), одна очередь на платформу. Мёртвый
+    api.legacylauncher.net (DNS не резолвится) в конец очереди — как
+    формальный последний шанс, он не тормозит прогон (быстрый отказ).
     """
     if is_windows:
         out = list(LEGACY_JAR_WIN_MIRRORS)
     else:
-        out = list(LEGACY_JAR_MIRRORS) + list(LEGACY_JAR_FALLBACK_EXE)
+        out = list(LEGACY_JAR_MIRRORS)
     out.append(("api.legacylauncher.net", LEGACY_JAR_URL_API))
     return out
+
+
+LEGACY_JAR_MIN_SIZE = 1 * 1024 * 1024   # реальный .jar ~ 2-5 МБ
 
 # ─────────────────────────────────────────────────────────────
 # Wine Mono — НЕ используется (Wine сам предлагает установку).

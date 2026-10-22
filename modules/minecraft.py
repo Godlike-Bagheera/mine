@@ -820,116 +820,34 @@ def _cached_jar_ok(cand):
         return False
 
 
-def _exe_size_ok(p):
-    try:
-        return p.exists() and p.stat().st_size > 2 * 1024 * 1024
-    except OSError:
-        return False
+def _legacy_curl_once(cand):
+    """ОДИН прогон curl.exe по единой очереди portable .jar.
 
+    Упрощение (проблема №2): раньше здесь было ДВЕ очереди (.jar и .exe-
+    установщик) и «всеядный» валидатор PK|MZ, из-за чего MZ-установщик
+    сохранялся в файл LegacyLauncher.jar и считался успехом. Теперь —
+    одна очередь (legacy_jar_mirrors) и строгий валидатор: принимается
+    ТОЛЬКО настоящий PK-.jar достаточного размера. Всё остальное (HTML-
+    заглушки фильтров, .exe, огрызки докачки) удаляется, чтобы не
+    имитировать успех и не сбивать поиск кэша при следующем запуске.
 
-def _exe_cached_ok(jar_dir):
-    # Плюс «Legacy Launcher Setup.exe» — имя, под которым браузер
-    # сохраняет официальный установщик; раньше кэш по нему не
-    # находился и 117 МБ качались заново.
-    from modules.config import LEGACY_EXE_CACHE_NAMES
-    if _exe_size_ok(jar_dir / LEGACY_EXE_CACHE_NAMES[0]):
-        return True
-    for nm in LEGACY_EXE_CACHE_NAMES[1:]:
-        if _exe_size_ok(jar_dir / nm):
-            return True
-    return False
-
-
-def _exe_cached_path(jar_dir):
-    """Куда реально лёг установщик (наше имя или имя браузера)."""
-    from modules.config import LEGACY_EXE_CACHE_NAMES
-    if _exe_size_ok(jar_dir / LEGACY_EXE_CACHE_NAMES[0]):
-        return jar_dir / LEGACY_EXE_CACHE_NAMES[0]
-    for nm in LEGACY_EXE_CACHE_NAMES[1:]:
-        if _exe_size_ok(jar_dir / nm):
-            return jar_dir / nm
-    return None
-
-
-def _legacy_curl_once(cand, exe_cand):
-    """ОДИН прогон curl.exe по всем очередям Legacy с общим бюджетом.
-
-    Очередь .jar-зеркал идёт первой; хвост очереди — официальный CDN,
-    отдающий .exe-установщик (не проходит _looks_like_jar!). Чтобы такой
-    файл не считался неудачей и НЕ перекачивался вторым кругом (именно
-    так рождалась простыня «curl не смог» из двух полных очередей),
-    валидатор принимает и PK-.jar, и MZ-.exe, а после прогона .exe
-    аккуратно перекладывается из cand в exe_cand.
-
-    Второй очередью добавляем чистый список .exe-CDN: если бюджет
-    кончится на jar-зеркалах, запасной путь всё равно получит заходы
-    (run_curl_queues делит бюджет между очередями). Возвращает резюме
-    run_curl_queues (dict).
+    Возвращает резюме run_curl_queues (dict).
     """
     from modules.download import run_curl_queues
-    from modules.config import LEGACY_WIN_OFFICIAL_CDN
 
-    def _validator(p):
-        try:
-            with open(p, "rb") as f:
-                head = f.read(2)
-            return head in (b"PK", b"MZ")
-        except OSError:
-            return False
-
-    resume = run_curl_queues([legacy_jar_mirrors(True),
-                              list(LEGACY_WIN_OFFICIAL_CDN)],
+    resume = run_curl_queues([legacy_jar_mirrors(True)],
                              cand,
                              min_bytes=LEGACY_JAR_MIN_SIZE,
-                             validator=_validator)
+                             validator=_looks_like_jar)
     url = resume.get("url")
-    if url and cand.exists():
-        if _looks_like_jar(cand):
-            ok(f"Legacy Launcher (.jar) скачан через curl: {url}")
-        else:
-            # Официальный CDN отдал .exe-установщик (MZ-, не PK-.jar).
-            # Переименовываем: это рабочий вариант для Windows —
-            # установщик сам ставит лаунчер (Qt-инсталлятор, нативный).
-            try:
-                os.replace(str(cand), str(exe_cand))
-                ok("Скачан официальный .exe-установщик Legacy Launcher "
-                   f"({exe_cand.stat().st_size / 1024 / 1024:.0f} МБ)")
-            except OSError as e:
-                debug.dbg_exc(e, "setup_legacy/rename-exe")
-                try:
-                    cand.unlink()
-                except OSError:
-                    pass
+    if url and cand.exists() and _looks_like_jar(cand):
+        ok(f"Legacy Launcher (.jar) скачан через curl: {url}")
     elif cand.exists():
         try:
-            cand.unlink()   # огрызок/HTML — мешается под кэшем
+            cand.unlink()   # огрызок/HTML/.exe — мешается под кэшем
         except OSError:
             pass
     return resume
-
-
-def _is_exe_installer(path):
-    """PE-исполняемый файл (MZ-заголовок)? Офиц. CDN отдаёт .exe вместо .jar."""
-    try:
-        with open(path, "rb") as f:
-            return f.read(2) == b"MZ"
-    except OSError:
-        return False
-
-
-def _legacy_exe_fallback(exe_path, queue):
-    """Запасной путь: скачивание официального .exe-установщика.
-
-    Если по пути уже лежит валидный установщик (например его принёс
-    _legacy_curl_once или браузер) — повторно ничего НЕ качаем: раньше
-    отсутствие этой проверки заставляло перекачивать 117 МБ вторым кругом.
-    """
-    from modules.download import download_queue_with_curl
-    if _exe_cached_ok(exe_path.parent):
-        return True
-    return bool(download_queue_with_curl(queue, exe_path,
-                                         min_bytes=2 * 1024 * 1024,
-                                         validator=_is_exe_installer))
 
 
 def _open_legacy_manual_page():
@@ -1020,13 +938,11 @@ def setup_legacy_portable():
         jar_path = existing
         ok(f"Portable .jar уже есть: {jar_path}")
     else:
-        # 2. Скачиваем.
-        #    Очередь зеркал: llaun.ch / dl.llaun.ch отдают НАСТОЯЩИЙ portable
-        #    bootstrap .jar (PK-сигнатура). api.legacylauncher.net иногда не
-        #    резолвится (DNS), а dl.legacylauncher.ru/legacy/installer — это
-        #    .exe-установщик, который к тому же отвечает 403 на запросы без
-        #    браузерных заголовков («в браузере открывается» ≠ «urlopen
-        #    работает»: у urllib другой TLS-фингерпринт и UA).
+        # 2. Скачиваем portable .jar по ЕДИНОЙ цепочке зеркал (один тип
+        #    файла). llaun.ch / dl.llaun.ch отдают настоящий bootstrap .jar
+        #    (PK-сигнатура) и поддерживают докачку; web.archive.org —
+        #    резерв для DPI-сетей. Скачанный файл проверяется на PK-магию:
+        #    HTML-заглушки фильтров и MZ-.exe успехом не считаются.
         info("Скачиваю Legacy Launcher Portable...")
         from modules.platform_utils import IS_WINDOWS as _IS_WIN
         mirrors = legacy_jar_mirrors(_IS_WIN)
@@ -1035,11 +951,16 @@ def setup_legacy_portable():
             "Legacy Launcher Portable",
             min_size_mb=1, silent=False,
         )
+        # Успех = файл есть, достаточного размера И это настоящий PK-.jar
+        # (download_file по одному размеру может пропустить .exe/огрызок).
+        if downloaded and not _looks_like_jar(jar_path):
+            debug.dbg(f"setup_legacy_portable: {jar_path.name} скачан, "
+                      "но это не PK-.jar — отвергаю", level="WARN")
+            downloaded = False
         if not downloaded:
-            # download_file при RST на всех Python-запросах оставляет на
-            # диске битые огрызки (HTML-заглушки фильтров, 302-страницы).
-            # Они НЕ проходят _looks_like_jar в _find_local_legacy_jar, но
-            # мешают повторной закачке — чистим.
+            # На диске могли остаться битые огрызки (HTML-заглушки фильтров,
+            # 302-страницы, чужой .exe). Они НЕ проходят _looks_like_jar в
+            # _find_local_legacy_jar, но мешают повторной закачке — чистим.
             try:
                 if jar_path.exists() and not _looks_like_jar(jar_path):
                     jar_path.unlink()
@@ -1190,11 +1111,17 @@ def setup_legacy_portable():
 
 
 def setup_legacy():
-    """Legacy Launcher.
+    """Legacy Launcher — portable .jar, одна цепочка зеркал, один тип файла.
 
-    .exe-установщик на Wine 11 стабильно падает с page fault в WOW64
-    (баг Wine, не наш). Если .exe-версии в префиксе нет — сразу идём в
-    Portable .jar, не тратя время на скачивание и запуск установщика.
+    Правильный лаунчер = bootstrap .jar (PK-сигнатура), который запускается
+    штатной Java (`java -jar`). Логика скачивания намеренно простая:
+      1) найти уже скачанный .jar (legacy-portable / Downloads);
+      2) не найден — ОДИН прогон curl.exe по единой jar-очереди (Windows);
+      3) скачать .jar через download_file (тот же список зеркал);
+      4> не вышло — понятное ручное скачивание (.jar, не установщик).
+    Смешение типов (.exe-установщик в очередь .jar, «запасные» очереди,
+    три круга перекачивания) из истории убрано: оно и рождало «нерабочую
+    логку скачивания Legacy».
 
     Перед скачиванием проверяем окружение: без Java portable-вариант
     физически не запустится, поэтому предупреждаем сразу и предлагаем
@@ -1240,24 +1167,20 @@ def setup_legacy():
 
     # Windows: если в сети RST-блокировка Python-TLS, питоновские попытки
     # в setup_legacy_portable падают на всех зеркалах. Сначала быстро
-    # прогоняем curl.exe ОДИН раз по всем очередям (см. run_curl_queues);
-    # скачанный jar затем увидит _find_local_legacy_jar() и
-    # setup_legacy_portable отработает офлайн.
-    #
-    # Раньше здесь шёл download_queue_with_curl по ВСЕМ зеркалам, а после
-    # неудачи setup_legacy_portable повторял тот же круг уже Python-ом, а
-    # третий круг качал .exe-запасной путь — в DPI-сети это простыня из
-    # «curl не смог: rc=35» на 5~7 минут вместо результата. Теперь один
-    # общий бюджет попыток на все очереди (MAX_CURL_QUEUE_ATTEMPTS).
+    # прогоняем curl.exe ОДИН раз по ЕДИНОЙ jar-очереди (run_curl_queues с
+    # общим бюджетом попыток и wall-clock лимитом); скачанный .jar затем
+    # увидит _find_local_legacy_jar() и setup_legacy_portable отработает
+    # офлайн. Запасных очередей (.exe-установщик) больше нет — смешение
+    # типов файлов и три круга перекачивания были главной причиной того,
+    # что «legacy качается бесконечно» и в итоге не работает.
     if _IS_WIN:
         jar_dir = WINE_DIR / "legacy-portable"
         jar_dir.mkdir(parents=True, exist_ok=True)
         cand = jar_dir / "LegacyLauncher.jar"
-        exe_cand = jar_dir / "LegacyLauncher-setup.exe"
 
-        if not _cached_jar_ok(cand) and not _exe_cached_ok(jar_dir):
-            resume = _legacy_curl_once(cand, exe_cand)
-            if resume.get("truncated"):
+        if not _cached_jar_ok(cand):
+            resume = _legacy_curl_once(cand)
+            if not resume.get("ok") and resume.get("truncated"):
                 warn(f"Сеть не пропускает домены лаунчера — "
                      f"сделано {resume['attempts']} заходов из "
                      f"{resume['mirrors_total']} (дальше бессмысленно).")
@@ -1265,55 +1188,14 @@ def setup_legacy():
                      "скачать .jar браузером (llaun.ch/jar) в Downloads, "
                      "скрипт найдёт его сам при следующем `legacy`.")
 
-        # Если есть скачанный .exe-установщик — запускаем его сразу,
-        # portable .jar больше не нужен (установщик сам всё поставит).
-        if _exe_cached_ok(jar_dir):
-            run_target = _exe_cached_path(jar_dir)
-            hint("Запускаю официальный установщик Legacy Launcher...")
-            try:
-                os.startfile(str(run_target))  # noqa: S606 — явное действие пользователя
-                ok("Установщик запущен.")
-                hint("После установки открой Legacy Launcher из меню «Пуск»,"
-                     " скачай в нём версию Minecraft и повтори `legacy` —"
-                     " скрипт найдёт установленный лаунчер сам.")
-                return True
-            except Exception as e:
-                debug.dbg(f"startfile: {e}", level="WARN")
-                hint(f"Запусти вручную двойным кликом: {run_target}")
-                return True
-
     good = setup_legacy_portable()
     if not good and _IS_WIN:
-        # На Windows сеть может рвать и TLS, и Java-запросы лаунчера.
-        # Запасной путь: официальный .exe через curl.exe (Schannel),
-        # потом запускаем установщик штатными средствами Windows.
-        # Приоритет — Yandex CDN (проверен: отдаёт настоящий .exe 117 МБ,
-        # медленный старт но стабильная закачка); старый URL — запасной.
-        hint("Portable не скачался — пробую запасной вариант: "
-             ".exe-установщик через curl.exe (как браузер)")
-        exe_path = WINE_DIR / "legacy-portable" / "LegacyLauncher-setup.exe"
-        from modules.download import warn_if_windows_proxy
-        from modules.config import LEGACY_WIN_OFFICIAL_CDN
-        # Перед каждой загрузкой — проверка прокси в настройках Windows:
-        # включённый прокси даёт «долго думает, но качает» и рвёт TLS.
-        warn_if_windows_proxy()
-        exe_queue = list(LEGACY_WIN_OFFICIAL_CDN) + \
-            [("installer (запасной)",
-              "https://dl.legacylauncher.ru/legacy/installer")]
-        got = _legacy_exe_fallback(exe_path, exe_queue)
-        if got:
-            ok(f"Скачан установщик: {exe_path}")
-            try:
-                os.startfile(str(exe_path))  # noqa: S606 — явное действие пользователя
-                hint("Запустился установщик — после установки добавь игру в"
-                     " лаунчере и повтори `legacy`")
-                return True
-            except Exception as e:
-                debug.dbg(f"startfile: {e}", level="WARN")
-                hint(f"Запусти вручную двойным кликом: {exe_path}")
-                return True
-        else:
-            err("curl.exe тоже не смог — сеть блокирует и его.")
+        err("Legacy Launcher Portable (.jar) не удалось ни скачать, ни запустить.")
+        hint("Ручной путь: скачай portable .jar на "
+             f"{LEGACY_MANUAL_PAGE} (прямая ссылка {LEGACY_MANUAL_JAR_URL})")
+        hint(f"и положи его в {WINE_DIR / 'legacy-portable'} или в «Загрузки» —")
+        hint("повтори `legacy`: скрипт найдёт файл сам и запустит через Java.")
+        hint("Если Java не установлена — команда install-java.")
     return good
 
 
