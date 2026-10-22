@@ -501,12 +501,14 @@ check(".exe-запасные очереди/хелперы (.exe cached/fallback
       and not hasattr(mc, "_exe_size_ok")
       and not hasattr(mc, "_legacy_exe_fallback"))
 
-# 11.5 _legacy_curl_once: ОДИН прогон единой jar-очереди со строгим
+# 11.5 _legacy_curl_once: быстрый прямой заход canonical URL (llaun.ch/jar,
+# как браузер), затем ОДИН прогон единой jar-очереди со строгим
 # валидатором; битый огрызок на диске удаляется (не имитирует успех).
 ledir2 = tmp / "lp2"
 ledir2.mkdir(exist_ok=True)
 cand2 = ledir2 / "LegacyLauncher.jar"
 _seen_rq = []
+_seen_direct = []
 
 
 def _fake_run_curl_queues_fail(queues, dest, **kw):
@@ -516,9 +518,21 @@ def _fake_run_curl_queues_fail(queues, dest, **kw):
             "truncated": False, "mirrors_total": 3}
 
 
+def _fake_dl_with_curl_fail(url, dest, **kw):
+    # Прямой заход canonical URL не срабатывает (например, DNS перехвачен)
+    # -> должен оставаться запасной путь: единая очередь зеркал.
+    _seen_direct.append(url)
+    return False
+
+
+_orig_dlwc = dl_mod2.download_with_curl
 dl_mod2.run_curl_queues = _fake_run_curl_queues_fail
 try:
+    # download_with_curl импортируется внутри функции — патчим модуль source.
+    dl_mod2.download_with_curl = _fake_dl_with_curl_fail
     resume = mc._legacy_curl_once(cand2)
+    check("_legacy_curl_once: сначала прямой заход canonical llaun.ch/jar",
+          _seen_direct == [cfg.LEGACY_MANUAL_JAR_URL])
     q, val = _seen_rq[0]
     check("_legacy_curl_once: одна очередь (не jar+exe)", len(q) == 1)
     check("_legacy_curl_once: очередь = legacy_jar_mirrors(True)",
@@ -529,8 +543,24 @@ try:
           not cand2.exists())
     check("_legacy_curl_once возвращает резюме прогона",
           resume["ok"] is False and resume["attempts"] == 3)
+
+    # Успех прямого пути: queue-зеркала вообще не нужны.
+    _seen_rq.clear()
+    _seen_direct.clear()
+
+    def _fake_dl_with_curl_ok(url, dest, **kw):
+        _seen_direct.append(url)
+        Path(dest).write_bytes(b"PK\x03\x04" + b"\x00" * (2 * 1024 * 1024))
+        return True
+
+    dl_mod2.download_with_curl = _fake_dl_with_curl_ok
+    resume2 = mc._legacy_curl_once(cand2)
+    check("_legacy_curl_once: прямойcanonical-успех без очереди зеркал",
+          _seen_rq == [] and resume2["ok"] is True
+          and resume2["url"] == cfg.LEGACY_MANUAL_JAR_URL)
 finally:
     dl_mod2.run_curl_queues = _orig_rcq
+    dl_mod2.download_with_curl = _orig_dlwc
 
 # 11.6 setup_legacy(): Windows-ветка делает ОДИН curl-прогон (не три круга),
 # только portable .jar, без смешения типов файлов.

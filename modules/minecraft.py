@@ -831,9 +831,28 @@ def _legacy_curl_once(cand):
     заглушки фильтров, .exe, огрызки докачки) удаляется, чтобы не
     имитировать успех и не сбивать поиск кэша при следующем запуске.
 
+    Дополнительно (фикс «llaun.ch открывается браузером, а качать нечем»):
+    перед очередью делается ОДИНА быстрая прямая закачка canonical URL
+    https://llaun.ch/jar через curl.exe без TLS-обходов — ровно то, что
+    делает браузер. В DPI-сетях это чаще всего срабатывает сразу, и
+    длинная очередь зеркал вообще не нужна.
+
     Возвращает резюме run_curl_queues (dict).
     """
-    from modules.download import run_curl_queues
+    from modules.download import run_curl_queues, download_with_curl
+
+    # 0. Быстрый путь: canonical URL напрямую (curl = поведение браузера).
+    try:
+        from modules.config import LEGACY_MANUAL_JAR_URL
+        if download_with_curl(LEGACY_MANUAL_JAR_URL, cand, timeout=90) \
+                and _looks_like_jar(cand):
+            ok(f"Legacy Launcher (.jar) скачан напрямую: "
+               f"{LEGACY_MANUAL_JAR_URL}")
+            return {"ok": True, "url": LEGACY_MANUAL_JAR_URL,
+                    "attempts": 1, "budget": 1,
+                    "truncated": False, "mirrors_total": 1}
+    except Exception as e:
+        debug.dbg(f"_legacy_curl_once direct: {e}", level="WARN")
 
     resume = run_curl_queues([legacy_jar_mirrors(True)],
                              cand,
@@ -863,10 +882,55 @@ def _open_legacy_manual_page():
     return False
 
 
+def _legacy_dns_hosts_props():
+    """Список -Dсвойств Java, обходящих перехват системного DNS (Windows).
+
+    Legacy Launcher пишет «проверьте подключение к Интернету», когда его
+    собственный резолвер получает заглушку фильтра (launchermeta.mojang.com
+    и т.п.), хотя браузер тот же сайт открывает. Сменить DNS JVM из скрипта
+    нельзя — но можно подменить имена через -Djdk.net.hosts.file: файл со
+    списком host=ip, который мы собираем прямым DNS-запросом к публичным
+    серверам (77.88.8.8/8.8.8.8) — там перехвата нет. Возвращает [] если
+    собирать нечего (не Windows / всё резолвится честно / ошибок).
+    """
+    from modules.platform_utils import IS_WINDOWS as _IS_WIN
+    if not _IS_WIN:
+        return []
+    try:
+        from modules.download import (resolve_dns, diagnose_dns,
+                                      NETCHECK_DOMAINS)
+        res = diagnose_dns(NETCHECK_DOMAINS[:6])
+        blocked = [d for d, r in res.items() if r["verdict"] == "dns_block"]
+        if not blocked:
+            return []
+        lines = []
+        for dom in blocked:
+            ips = resolve_dns(dom)
+            if ips:
+                lines.append(f"{dom}={ips[0]}")
+        if not lines:
+            return []
+        hosts_file = WINE_DIR / "legacy-portable" / "ll-hosts.properties"
+        hosts_file.parent.mkdir(parents=True, exist_ok=True)
+        hosts_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        debug.dbg(f"_legacy_dns_hosts_props: {lines}")
+        return [f"-Djdk.net.hosts.file={hosts_file}",
+                "-Djava.net.preferIPv4Stack=true"]
+    except Exception as e:
+        debug.dbg(f"_legacy_dns_hosts_props: {e}", level="WARN")
+        return []
+
+
 def _run_legacy_jar(jar_path):
     """Запуск portable .jar через найденную Java (без Wine).
 
     На Windows — detached-запуск (javaw), терминал не блокируется.
+    Все -Dсвойства передаются АРГУМЕНТАМИ ДО -jar (как флаги java, а не
+    как класс — иначе получается ровно то, что видел пользователь:
+    `Error: Could not find or load main class .net.ssl.trustStoreType...`).
+    Дополнительно: при DNS-перехвате провайдером передаём JVM файл подмены
+    hosts (-Djdk.net.hosts.file) — лаунчер перестаёт видеть заглушки
+    фильтра по launchermeta.mojang.com и прочим.
     Возвращает True, если процесс реально стартовал; иначе понятное
     сообщение и False (пользователь сможет запустить jar двойным кликом).
     """
@@ -885,15 +949,22 @@ def _run_legacy_jar(jar_path):
             truststore = _find_system_truststore()
         except Exception as e:
             debug.dbg(f"truststore: {e}", level="WARN")
+        opts = []
         if truststore and not _IS_WIN:
             # Red OS/OpenJDK: русские CA в системном truststore, но не в
             # cacerts JVM — внутренний http-клиент лаунчера падает по SSL.
-            opts = env.get("JAVA_TOOL_OPTIONS", "")
-            env["JAVA_TOOL_OPTIONS"] = (
-                (opts + " " if opts else "")
-                + f"-Djavax.net.ssl.trustStore={truststore} "
-                  "-Djavax.net.ssl.trustStorePassword="
-                + SYSTEM_TRUSTSTORE_PASSWORD)
+            # Раньше эти свойства попадали в JAVA_TOOL_OPTIONS одной строкой;
+            # теперь — отдельными аргументами до -jar (надёжнее: опечатка в
+            # такой строке превращала свойство в «main class» с
+            # ClassNotFoundException, что и наблюдал пользователь).
+            opts += [f"-Djavax.net.ssl.trustStore={truststore}",
+                     "-Djavax.net.ssl.trustStorePassword="
+                     + SYSTEM_TRUSTSTORE_PASSWORD]
+        if _IS_WIN:
+            # Системное хранилище Windows (корни Минцифры) — штатный
+            # механизм доверия JVM на этой платформе.
+            opts.append("-Djavax.net.ssl.trustStoreType=Windows-ROOT")
+            opts += _legacy_dns_hosts_props()
         exe = java_bin
         if _IS_WIN:
             # javaw.exe — окно лаунчера без чёрной консоли; если рядом его
@@ -901,11 +972,11 @@ def _run_legacy_jar(jar_path):
             cand = Path(java_bin).with_name("javaw.exe")
             if cand.is_file():
                 exe = str(cand)
-            subprocess.Popen([exe, "-jar", str(jar_path)], env=env,
+            subprocess.Popen([exe, *opts, "-jar", str(jar_path)], env=env,
                              cwd=str(Path(jar_path).parent))
             ok("Legacy Launcher запущен (окно откроется отдельно)")
         else:
-            subprocess.Popen([exe, "-jar", str(jar_path)], env=env,
+            subprocess.Popen([exe, *opts, "-jar", str(jar_path)], env=env,
                              cwd=str(Path(jar_path).parent))
             ok("Legacy Launcher запущен")
         return True

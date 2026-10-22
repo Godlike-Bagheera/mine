@@ -2209,6 +2209,143 @@ def set_firewall_all(enabled):
     return False
 
 
+def resolve_dns(domain, timeout=4):
+    """DNS A-запрос с обходом перехвата системным DNS.
+
+    Сначала обычный getaddrinfo; если ответ пустой или это известная
+    заглушка (127.x — локальный фильтр, 128.0.101.x — LOPHIBUR),
+    запрашиваем адрес напрямую через Яндекс/Google DNS (прямые сокеты,
+    UDP:53). Возвращает список IPv4-строк (может быть пустым).
+    Нужен для Java: ей можно выдать -Djava.net.preferIPv4Stack +hosts-
+    подмену, потому что саму Java сменить DNS нельзя из скрипта без админа.
+    """
+    ips = []
+    try:
+        infos = socket.getaddrinfo(domain, None, socket.AF_INET)
+        ips = sorted({i[4][0] for i in infos})
+    except Exception as e:
+        debug.dbg(f"resolve_dns system {domain}: {e}", level="WARN")
+    def _is_stub(lst):
+        return bool(lst) and all(ip.startswith("127.")
+                                 or ip.startswith("128.0.101.") for ip in lst)
+    if not ips or _is_stub(ips):
+        for server, _name in PUBLIC_DNS:
+            got = _dns_query_a(domain, server, timeout=timeout)
+            if got:
+                return got
+    return ips
+
+
+def add_firewall_rules_for_java(java_bin=None):
+    """Точечно разрешает Java в брандмауэре Windows (нужен админ).
+
+    Предпочтительнее полного отключения: netsh advfirewall firewall add
+    rule name="..." dir=in action=allow program="<javaw.exe>" profile=any.
+    Добавляет правила для javaw.exe и java.exe рядом с java_bin (и для
+    уже известных программ из PATH). Возвращает число добавленных правил;
+    при отсутствии прав/не-Windows возвращает 0 (печатает инструкцию).
+    """
+    from modules.platform_utils import IS_WINDOWS as _IS_WIN
+    if not _IS_WIN:
+        return 0
+    programs = []
+    candidates = []
+    if java_bin:
+        p = Path(java_bin)
+        candidates.append(p)
+        try:
+            candidates.append(p.with_name("javaw.exe"))
+        except Exception:
+            pass
+    # Стандартные места установки JDK (winget/Microsoft OpenJDK)
+    pf = os.environ.get("ProgramFiles", r"C:\\Program Files")
+    for sub in ("Eclipse Adoptium\\jdk-17\\bin", "Microsoft\\jdk-17.0.9.8-hotspot\\bin"):
+        candidates.append(Path(pf) / sub / "javaw.exe")
+        candidates.append(Path(pf) / sub / "java.exe")
+    seen = set()
+    for c in candidates:
+        try:
+            if c.is_file():
+                key = str(c).lower()
+                if key not in seen:
+                    seen.add(key)
+                    programs.append(str(c))
+        except OSError:
+            continue
+    added = 0
+    for prog in programs:
+        name = f"Mine Portable Java ({Path(prog).stem})"
+        try:
+            r = subprocess.run(
+                ["netsh", "advfirewall", "firewall", "add", "rule",
+                 f"name={name}", "dir=in", "action=allow",
+                 f"program={prog}", "enable=yes", "profile=any"],
+                capture_output=True, text=True, timeout=20)
+            out = ((r.stdout or "") + (r.stderr or "")).lower()
+            if r.returncode == 0 and "ok." in out or "already" in out:
+                added += 1
+            else:
+                debug.dbg(f"fw rule {prog}: rc={r.returncode} {out[:160]}",
+                          level="WARN")
+        except Exception as e:
+            debug.dbg(f"add_firewall_rules_for_java: {e}", level="WARN")
+    if added:
+        ok(f"Брандмауэр: разрешены входящие для Java (правил добавлено: {added})")
+    elif programs:
+        warn("Не удалось добавить правила брандмауэра (нужны права администратора).")
+        hint("В cmd ОТ АДМИНИСТРАТОРА:")
+        for prog in programs:
+            hint(f'  netsh advfirewall firewall add rule name="Mine Java" '
+                 f'dir=in action=allow program="{prog}" enable=yes')
+    return added
+
+
+def download_with_curl(url, dest, timeout=60):
+    """Одна прямая закачка curl.exe (Schannel — как у браузера).
+
+    Быстрый путь, когда браузер сайт открывает, а Python TLS рвётся
+    (RST/DPI на handshake). Не использует зеркала/докачку/прокси-обходы:
+    ровно один заход curl -L --fail по указанному URL. Возвращает True,
+    если файл скачался и выглядит бинарным (PK/gzip/ELF по расширению);
+    HTML-заглушки и огрызки удаляются.
+    """
+    exe = shutil_which_curl()
+    if not exe:
+        return False
+    dest = Path(dest)
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    try:
+        r = subprocess.run(
+            [exe, "-L", "--fail", "--max-time", str(timeout),
+             "--retry", "2", "--retry-delay", "1",
+             "-A", CURL_BROWSER_UA, "-o", str(tmp), url],
+            capture_output=True, text=True, timeout=timeout + 15)
+        if r.returncode != 0 or not tmp.exists():
+            debug.dbg(f"curl one-shot {url}: rc={r.returncode} "
+                      f"{(r.stderr or '').strip()[:160]}", level="WARN")
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+            return False
+        if tmp.stat().st_size < 1024 or not _looks_binary(tmp):
+            debug.dbg(f"curl one-shot {url}: скачался не бинарник — удаляю",
+                      level="WARN")
+            tmp.unlink(missing_ok=True)
+            return False
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(tmp, dest)
+        return True
+    except Exception as e:
+        debug.dbg(f"download_with_curl {url}: {e}", level="WARN")
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+
+
 def _ask_yes_no(question, default=True):
     """Да/Нет-вопрос в REPL; Enter = default; не-TTY (пайп/CI) = default."""
     suffix = " [Y/n]: " if default else " [y/N]: "
@@ -2335,9 +2472,10 @@ def ensure_clean_network(interactive=True):
 
         # ── 3. Брандмауэр Windows ──────────────────────────────────────
         # Брандмауэр не фильтрует исходящие закачки, но может блокировать
-        # входящие подключения Java (Legacy Launcher пишет «недоступные
-        # домены», хотя netcheck зелёный). Полное отключение снижает
-        # защиту — поэтому вопрос с default=«Нет».
+        # Java (Legacy Launcher пишет «недоступные домены», хотя netcheck
+        # зелёный). Порядок: сначала точечное правило «разрешить Java»
+        # (безопасно), полное отключение — только если пользователь сам
+        # попросил (вопрос с default=«Нет»).
         fw = firewall_state()
         if fw and any(v == "on" for v in fw.values()):
             on_profiles = [k for k, v in fw.items() if v == "on"]
@@ -2347,10 +2485,19 @@ def ensure_clean_network(interactive=True):
                  "«недоступные домены» — скорее всего блокируется "
                  "javaw.exe. Безопаснее разрешить её во входящих, чем "
                  "отключать брандмауэр целиком.")
-            do = interactive and _ask_yes_no(
+            do_rules = interactive and _ask_yes_no(
+                "Разрешить Java (java/javaw) в брандмауэре?")
+            if do_rules:
+                try:
+                    from modules.java import find_java
+                    jb, _, _ = find_java()
+                except Exception:
+                    jb = None
+                add_firewall_rules_for_java(jb)
+            do_off = interactive and _ask_yes_no(
                 "Временно отключить брандмауэр на всех профилях?",
                 default=False)
-            if do:
+            if do_off:
                 if _net_load("net_original_firewall") is None:
                     _net_save("net_original_firewall", fw)
                 if set_firewall_all(False):
@@ -2485,7 +2632,14 @@ def cmd_netrestore():
 
 
 def check_reachable(url, timeout=8):
-    """Быстрая HEAD/GET-проверка доступности HTTPS-URL. True/False."""
+    """Быстрая HEAD/GET-проверка доступности HTTPS-URL. True/False.
+
+    Фоллбэк через curl.exe: в DPI-сетях Python TLS рвётся (RST на
+    handshake / перехват системного DNS), а браузер этот же сайт
+    открывает — curl использует Schannel и системный резолвер так же,
+    как браузер. Без фоллбэка netcheck показывал «llaun.ch НЕДОСТУПЕН»
+    при реально живом сайте, и пользователь не понимал, где проблема.
+    """
     try:
         req = urllib.request.Request(
             url, method="HEAD",
@@ -2494,7 +2648,20 @@ def check_reachable(url, timeout=8):
             return 200 <= getattr(r, "status", 200) < 400
     except Exception as e:
         debug.dbg(f"reachable {url}: {e}", level="WARN")
-        return False
+    exe = shutil_which_curl()
+    if exe:
+        try:
+            r = subprocess.run(
+                [exe, "-sIL", "--max-time", str(timeout),
+                 "-A", CURL_BROWSER_UA, "-o", os.devnull, url],
+                capture_output=True, text=True, timeout=timeout + 5)
+            if r.returncode == 0:
+                return True
+            debug.dbg(f"reachable curl {url}: rc={r.returncode} "
+                      f"{(r.stderr or '').strip()[:120]}", level="WARN")
+        except Exception as e:
+            debug.dbg(f"reachable curl {url}: {e}", level="WARN")
+    return False
 
 
 def cmd_netcheck():
@@ -2518,9 +2685,11 @@ def cmd_netcheck():
              f"{', '.join(blocked)}")
         hint("Быстрый автофикс (с подтверждением): команда netfix "
              "(выключит прокси, поставит 77.88.8.8/8.8.8.8 и предложит "
-             "отключить брандмауэр; отмена — netrestore)")
+             "разрешить Java в брандмауэре; отмена — netrestore)")
         hint("Вручную: Поставь DNS 77.88.8.8 / 8.8.8.8 "
              "(Параметры сети → IPv4 → использовать следующие серверы)")
+        hint("77.88.8.8 — Яндекс DNS, 8.8.8.8 — Google DNS (публичные, "
+             "перехват провайдера на них не действует)")
     if dead and len(dead) == len(res):
         err("Похоже, интернет действительно отсутствует "
             "(не резолвятся даже через 8.8.8.8).")
@@ -2540,8 +2709,21 @@ def cmd_netcheck():
         print(f"  {'🟡' if any_on else '✅'} Брандмауэр Windows         {fw_txt}")
         if any_on:
             hint("Брандмауэр включён — если Java блокируется, команда netfix "
-                 "предложит временно отключить его (отмена — netrestore).")
+                 "предложит разрешить javaw.exe во входящих (или временно "
+                 "отключить брандмауэр; отмена — netrestore).")
     info("Если здесь всё зелёное, а Legacy Launcher пишет «недоступные "
          "домены» — блокируется сама Java (брандмауэр/антивирус/DPI): "
          "разреши javaw.exe в брандмауэре Windows.")
+    # Автофикс по итогам диагностики: правила для Java + быстрый curl-прогон
+    from modules.platform_utils import IS_WINDOWS as _IS_WIN
+    if _IS_WIN and (blocked or dead):
+        try:
+            from modules.java import find_java
+            java_bin, _jh, _js = find_java()
+            add_firewall_rules_for_java(java_bin)
+        except Exception as e:
+            debug.dbg_exc(e, "cmd_netcheck/java-rules")
+        hint("Скачать .jar в обход блокировок Python TLS можно командой "
+             "`legacy` — скрипт сам прогонит curl.exe (как браузер) и "
+             "положит файл в legacy-portable.")
 
