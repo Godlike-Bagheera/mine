@@ -146,9 +146,9 @@ def print_help():
     print(f"  {CYAN}netcheck{RESET}            — диагностика сети/DNS "
           f"(если «недоступные домены» при живом интернете)")
     print(f"  {CYAN}netfix{RESET}             — автопочинка: выключить прокси "
-          f"Windows + поставить DNS 77.88.8.8/8.8.8.8 (с подтверждением)")
-    print(f"  {CYAN}netrestore{RESET}         — вернуть прокси/DNS, которые "
-          f"менял netfix")
+          f"+ DNS 77.88.8.8/8.8.8.8 + (опц.) отключить брандмауэр")
+    print(f"  {CYAN}netrestore{RESET}         — вернуть прокси/DNS/брандмауэр, "
+          f"которые менял netfix")
     print(f"{BOLD}── Прочее ────────────────────────────────────────{RESET}")
     print(f"  {CYAN}history{RESET}, {CYAN}log{RESET}         — история / последний лог")
     print(f"  {CYAN}help{RESET}, {CYAN}?{RESET}             — эта справка")
@@ -428,8 +428,9 @@ def _netcheck_summary():
         elif blocked:
             warn(f"DNS-блокировка: {', '.join(blocked)} — интернет есть, "
                  f"но провайдер перехватывает эти домены.")
-            hint("Команда netfix — выключит прокси и поставит DNS "
-                 "77.88.8.8 / 8.8.8.8 (с подтверждением); подробности: "
+            hint("Команда netfix — выключит прокси, поставит DNS "
+                 "77.88.8.8 / 8.8.8.8 и при желании временно отключит "
+                 "брандмауэр (с подтверждением); подробности: "
                  f"команда {CYAN}netcheck{RESET}")
         else:
             ok("DNS: домены лаунчера резолвятся корректно")
@@ -462,6 +463,21 @@ def print_diagnostics():
                 ok("Прокси Windows: выключен")
         except Exception as e:
             debug.dbg_exc(e, "print_diagnostics/proxy")
+        # Сеть: состояние брандмауэра — может блокировать входящие Java
+        try:
+            from modules.download import firewall_state
+            fw = firewall_state()
+            if fw is None:
+                debug.dbg("firewall_state: недоступно", level="WARN")
+            elif any(v == "on" for v in fw.values()):
+                warn("Брандмауэр Windows: ВКЛЮЧЕН ("
+                     + ", ".join(f"{k}={v}" for k, v in fw.items())
+                     + ") — может блокировать javaw.exe; netfix предложит "
+                       "временно отключить (отмена — netrestore)")
+            else:
+                ok("Брандмауэр Windows: выключен")
+        except Exception as e:
+            debug.dbg_exc(e, "print_diagnostics/firewall")
         mc_dirs = find_minecraft_dirs(limit=8)
         if mc_dirs:
             for d in mc_dirs[:5]:
@@ -587,8 +603,9 @@ def main():
         # ── Нативный путь Windows 10: Wine/DXVK/winetricks не нужны вовсе ──
         # Сперва чиним сеть: в общих сетях прокси из реестра рвёт TLS у
         # Python/curl, а кастомный DNS подменяет домены лаунчера — без этого
-        # любая загрузка выглядит как «интернета нет». (С подтверждением;
-        # откат — netrestore.)
+        # любая загрузка выглядит как «интернета нет». Плюс опциональное
+        # временное отключение брандмауэра (блокирует входящие javaw.exe).
+        # (Всё с подтверждением; откат — netrestore.)
         ensure_clean_network()
         java_bin, java_home, java_status = find_java()
         if java_home or java_bin:

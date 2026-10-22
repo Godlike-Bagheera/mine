@@ -2158,6 +2158,57 @@ def disable_winhttp_proxy():
     return False
 
 
+def firewall_state():
+    """Состояние брандмауэра Windows по профилям.
+
+    Возвращает dict {profile: "on"/"off"} (profile: DomainPublic/Private/All)
+    либо None, если определить не удалось (не Windows / нет прав / PowerShell
+    недоступен). Права администратора для ЧТЕНИЯ состояния обычно есть и у
+    обычного пользователя; при Access denied вернёт None.
+    """
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-NetFirewallProfile | "
+             "Select-Object Name,Enabled | ConvertTo-Csv -NoTypeInformation"],
+            capture_output=True, text=True, timeout=25)
+        if r.returncode != 0:
+            debug.dbg(f"firewall_state failed (rc={r.returncode}): "
+                      f"{(r.stderr or '').strip()[:200]}", level="WARN")
+            return None
+        out = {}
+        for line in (r.stdout or "").splitlines()[1:]:
+            parts = [p.strip('"') for p in line.split(",")]
+            if len(parts) >= 2:
+                enabled = parts[1].lower() in ("true", "enabled", "истина")
+                out[parts[0]] = "on" if enabled else "off"
+        return out or None
+    except Exception as e:
+        debug.dbg(f"firewall_state: {e}", level="WARN")
+        return None
+
+
+def set_firewall_all(enabled):
+    """Вкл/выкл брандмауэр Windows на всех профилях (нужен админ).
+
+    netsh advfirewall all set state on|off — возвращает True при успехе.
+    """
+    state = "on" if enabled else "off"
+    try:
+        r = subprocess.run(["netsh", "advfirewall", "set", "all",
+                            "firewall", "state", state],
+                           capture_output=True, text=True, timeout=30)
+        out = ((r.stdout or "") + (r.stderr or "")).strip()
+        if r.returncode == 0:
+            debug.dbg(f"set_firewall_all({state}): {out[:200]}")
+            return True
+        debug.dbg(f"set_firewall_all({state}) failed "
+                  f"(rc={r.returncode}): {out[:200]}", level="WARN")
+    except Exception as e:
+        debug.dbg(f"set_firewall_all: {e}", level="WARN")
+    return False
+
+
 def _ask_yes_no(question, default=True):
     """Да/Нет-вопрос в REPL; Enter = default; не-TTY (пайп/CI) = default."""
     suffix = " [Y/n]: " if default else " [y/N]: "
@@ -2191,7 +2242,7 @@ def _net_load(key, default=None):
 def ensure_clean_network(interactive=True):
     """Проверка и (с согласия) починка сети Windows перед загрузками.
 
-    Делает две вещи:
+    Делает три вещи:
       1. Прокси: если ProxyEnable=1 — предлагает выключить (запись
          ProxyEnable=0 в HKCU\\...\\Internet Settings, права обычного
          пользователя достаточно) + `netsh winhttp reset proxy` (для него
@@ -2202,6 +2253,11 @@ def ensure_clean_network(interactive=True):
          системные DNS нестандартные — сохраняет их в settings.json и
          предлагает поставить 77.88.8.8 / 8.8.8.8 (netsh interface ip
          set dns, нужны права админа — при Access denied инструкция).
+      3. Брандмауэр: если включён — предлагает временно отключить на всех
+         профилях (netsh advfirewall ... state off, нужен админ). Оригинал
+         сохраняется в settings.json — вернуть: команда `netrestore`.
+         По умолчанию ответ «Нет»: полное отключение снижает защиту
+         системы; предпочтительнее точечно разрешить javaw.exe во входящих.
 
     Вызывается из ui.main() на старте (только Windows), а также командой
     `netfix`. Никаких исключений наружу не выпускает.
@@ -2276,6 +2332,41 @@ def ensure_clean_network(interactive=True):
                          f"dns \"{iface}\" static {PUBLIC_DNS[0][0]}")
                     hint(f"и: netsh interface ip add dns \"{iface}\" "
                          f"{PUBLIC_DNS[1][0]} index=2")
+
+        # ── 3. Брандмауэр Windows ──────────────────────────────────────
+        # Брандмауэр не фильтрует исходящие закачки, но может блокировать
+        # входящие подключения Java (Legacy Launcher пишет «недоступные
+        # домены», хотя netcheck зелёный). Полное отключение снижает
+        # защиту — поэтому вопрос с default=«Нет».
+        fw = firewall_state()
+        if fw and any(v == "on" for v in fw.values()):
+            on_profiles = [k for k, v in fw.items() if v == "on"]
+            warn("Брандмауэр Windows включён "
+                 f"(профили: {', '.join(on_profiles)}).")
+            hint("Если netcheck зелёный, а Legacy Launcher пишет "
+                 "«недоступные домены» — скорее всего блокируется "
+                 "javaw.exe. Безопаснее разрешить её во входящих, чем "
+                 "отключать брандмауэр целиком.")
+            do = interactive and _ask_yes_no(
+                "Временно отключить брандмауэр на всех профилях?",
+                default=False)
+            if do:
+                if _net_load("net_original_firewall") is None:
+                    _net_save("net_original_firewall", fw)
+                if set_firewall_all(False):
+                    ok("Брандмауэр Windows временно отключён. "
+                       "Вернуть: команда netrestore")
+                    fixed.append("firewall")
+                else:
+                    err("Не удалось отключить брандмауэр — нужны права "
+                        "администратора.")
+                    hint("В cmd ОТ АДМИНИСТРАТОРА: netsh advfirewall set "
+                         "all state off")
+                    hint("Либо точечно: Панель управления -> Брандмауэр "
+                         "Windows -> Разрешение взаимодействия с приложением "
+                         "-> разрешить javaw.exe (частная и общедоступная "
+                         "сети).")
+
         # Итог: если чинили — перечитать состояние прокси для curl-флагов
         if fixed:
             global _proxy_warned
@@ -2376,6 +2467,18 @@ def cmd_netrestore():
         else:
             err("Не удалось вернуть DNS (нужны права администратора): "
                 f"netsh interface ip set dns \"<Интерфейс>\" static {first}")
+    fw = _net_load("net_original_firewall")
+    if fw:
+        want_on = any(v == "on" for v in fw.values())
+        if set_firewall_all(want_on):
+            ok(f"Брандмауэр Windows восстановлен: "
+               f"{'включён' if want_on else 'выключен'} "
+               f"(профили: {', '.join(k + '=' + v for k, v in fw.items())})")
+            restored.append("firewall")
+        else:
+            err("Не удалось вернуть состояние брандмауэра (нужны права "
+                "администратора): netsh advfirewall set all state "
+                + ("on" if want_on else "off"))
     if not restored:
         info("Нечего восстанавливать — netfix ничего не менял "
              "(сохранений в settings.json нет).")
@@ -2414,8 +2517,8 @@ def cmd_netcheck():
         warn(f"DNS-перехват затронул {len(blocked)} домен(ов): "
              f"{', '.join(blocked)}")
         hint("Быстрый автофикс (с подтверждением): команда netfix "
-             "(отключит прокси и поставит 77.88.8.8/8.8.8.8; отмена — "
-             "netrestore)")
+             "(выключит прокси, поставит 77.88.8.8/8.8.8.8 и предложит "
+             "отключить брандмауэр; отмена — netrestore)")
         hint("Вручную: Поставь DNS 77.88.8.8 / 8.8.8.8 "
              "(Параметры сети → IPv4 → использовать следующие серверы)")
     if dead and len(dead) == len(res):
@@ -2430,6 +2533,14 @@ def cmd_netcheck():
                       ("https://llaun.ch/jar", "llaun.ch")):
         state_txt = "доступен" if check_reachable(url) else "НЕДОСТУПЕН"
         print(f"  {'✅' if state_txt == 'доступен' else '⚠️ '} {name:28} {state_txt}")
+    fw = firewall_state()
+    if fw is not None:
+        fw_txt = ", ".join(f"{k}: {v}" for k, v in fw.items())
+        any_on = any(v == "on" for v in fw.values())
+        print(f"  {'🟡' if any_on else '✅'} Брандмауэр Windows         {fw_txt}")
+        if any_on:
+            hint("Брандмауэр включён — если Java блокируется, команда netfix "
+                 "предложит временно отключить его (отмена — netrestore).")
     info("Если здесь всё зелёное, а Legacy Launcher пишет «недоступные "
          "домены» — блокируется сама Java (брандмауэр/антивирус/DPI): "
          "разреши javaw.exe в брандмауэре Windows.")
